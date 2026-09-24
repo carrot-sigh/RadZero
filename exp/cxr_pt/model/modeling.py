@@ -316,8 +316,12 @@ class CxrAlignModel(BasePreTrainedModel):
             if self.loss_fns["RadZeroLoss"].use_vision_cls_token:
                 outputs["similarity_scores"] = outputs["similarity_scores"][:, :, 1:]
 
-            # compute logits
-            if self.loss_fns["RadZeroLoss"].compute_i2t_loss:
+            # Use image-to-text logits only when the loss implementation provides them.
+            # Older RadZeroLoss versions compute text-to-image logits only.
+            if (
+                getattr(self.loss_fns["RadZeroLoss"], "compute_i2t_loss", False)
+                and "i2t_logits" in loss_outputs
+            ):
                 logits = (loss_outputs["t2i_logits"] + loss_outputs["i2t_logits"]) / 2
             else:
                 logits = loss_outputs["t2i_logits"]
