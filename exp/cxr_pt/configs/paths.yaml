@@ -4,7 +4,8 @@ experiment:
   output_root_dir: /data/experiments
 
 dataset:
-  data_root: /data/datasets
+  data_root: /home/user/gxq/radzero-data/data
+  mimic_cxr_jpg_root: /home/user/gxq/Data/mimic-cxr-jpg-2.1.0
 
 model:
   model_config:

@@ -15,6 +15,36 @@ from common.utils import load_json
 from exp.cxr_pt.model.processing import M3AEImageProcessor
 
 
+_MIMIC_IMAGE_INDEX = {}
+
+
+def _resolve_mimic_image_path(dicom_id, data_root, mimic_cxr_jpg_root=None):
+    """Resolve a RadZero dicom id against common MIMIC-CXR-JPG layouts."""
+    direct_path = os.path.join(data_root, "MIMIC-CXR", "images", dicom_id)
+    if os.path.isfile(direct_path):
+        return direct_path
+
+    image_root = mimic_cxr_jpg_root or os.path.join(data_root, "mimic-cxr-jpg-2.1.0")
+    image_root = os.path.abspath(image_root)
+    indexed_paths = _MIMIC_IMAGE_INDEX.get(image_root)
+    if indexed_paths is None:
+        indexed_paths = {}
+        files_root = os.path.join(image_root, "files")
+        if os.path.isdir(files_root):
+            for root, _, filenames in os.walk(files_root):
+                for filename in filenames:
+                    if filename.lower().endswith((".jpg", ".jpeg")):
+                        indexed_paths.setdefault(filename, os.path.join(root, filename))
+        _MIMIC_IMAGE_INDEX[image_root] = indexed_paths
+
+    resolved_path = indexed_paths.get(dicom_id)
+    if resolved_path is None:
+        raise FileNotFoundError(
+            f"Could not find {dicom_id!r} under MIMIC-CXR-JPG root {image_root!r}."
+        )
+    return resolved_path
+
+
 def input_json_file_load(json_path, data_root, train_flag, **kwargs):
     logger.info(f"load dataset: {json_path}")
     input_json = load_json(os.path.join(data_root, json_path))
@@ -39,8 +69,10 @@ def input_json_file_load(json_path, data_root, train_flag, **kwargs):
                 continue
 
             entry = {}
-            image_path = os.path.join(
-                data_root, "MIMIC-CXR", "images", data["dicom_id"]
+            image_path = _resolve_mimic_image_path(
+                data["dicom_id"],
+                data_root,
+                kwargs.get("mimic_cxr_jpg_root"),
             )
             entry["image"] = image_path
 
@@ -181,4 +213,3 @@ def tokenize_batch(tokenizer, batch, truncation=True, padding=True, max_length=N
         ]
 
     return outputs
-
