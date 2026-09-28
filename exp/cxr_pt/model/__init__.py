@@ -7,6 +7,17 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from common.trainer import logger
 
 from .configuration import CxrAlignConfig
+from .hierarchy import (
+    AnatomyGroundingHead,
+    AnatomyGroundingOutput,
+    AnatomyMaskedFindingHead,
+    FindingAggregationOutput,
+    FindingEvidenceAggregator,
+    FindingRecognitionOutput,
+    GatedEvidenceFusion,
+    GatedFusionOutput,
+    GlobalEvidenceBranch,
+)
 from .modeling import CxrAlignModel
 from .processing import load_processor
 from .vlcabs import VLCABS, VLCABSOutput

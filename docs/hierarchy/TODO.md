@@ -22,11 +22,11 @@
 
 - [x] Refactor VL-CABS to return similarity maps, attention, evidence, and logits.
 - [x] Add masked-softmax support with an empty-mask fallback.
-- [ ] Implement the anatomy ROI mask head.
-- [ ] Implement Anatomy-Masked VL-CABS for region-finding pairs.
-- [ ] Add finding-logit temperature and bias.
-- [ ] Implement finding evidence aggregation for each global label.
-- [ ] Implement the global VL-CABS branch and gated fusion.
+- [x] Implement the anatomy ROI mask head.
+- [x] Implement Anatomy-Masked VL-CABS for region-finding pairs.
+- [x] Add finding-logit temperature and bias.
+- [x] Implement finding evidence aggregation for each global label.
+- [x] Implement the global VL-CABS branch and gated fusion.
 - [ ] Preserve the original RadZero forward and zero-shot inference paths.
 
 ## P3 - Training
@@ -51,9 +51,9 @@
 ## P5 - Verification
 
 - [ ] Test bbox transforms and left/right semantics.
-- [ ] Test masked softmax and empty ROIs for finite outputs.
+- [x] Test masked softmax and empty ROIs for finite outputs.
 - [ ] Test that unknown labels do not contribute to losses.
-- [ ] Test Stage 1 -> Stage 2 -> Stage 3 tensor contracts.
-- [ ] Test gradient flow from global loss to the ROI head.
+- [x] Test Stage 1 -> Stage 2 -> Stage 3 tensor contracts.
+- [x] Test gradient flow from global loss to the ROI head.
 - [ ] Run a tiny-overfit experiment.
 - [x] Add a regression test for original RadZero logits and inference shapes.
