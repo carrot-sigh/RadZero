@@ -226,11 +226,13 @@ class SimilarityLogit(nn.Module):
         query_attn_features = F.normalize(query_attn_features, p=2, dim=-1)
         aggregated = F.normalize(aggregated, p=2, dim=-1)
 
-        logits = torch.matmul(
-            query_attn_features.unsqueeze(2), aggregated.unsqueeze(-1)
-        ).squeeze()
+        logits = (
+            torch.matmul(query_attn_features.unsqueeze(2), aggregated.unsqueeze(-1))
+            .squeeze(-1)
+            .squeeze(-1)
+        )
 
-        logits = logits.T
+        logits = logits.transpose(0, 1)
 
         if need_attn_weights:
             attn_scores = [scores]
