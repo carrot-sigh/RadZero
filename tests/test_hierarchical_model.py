@@ -172,6 +172,66 @@ class HierarchicalModelTest(unittest.TestCase):
                 self.encoded_global,
             )
 
+    def test_hierarchy_loss_is_attached_and_backpropagates(self):
+        anatomy_targets = torch.randint(
+            0, 2, (self.batch_size, self.anatomies, self.tokens)
+        ).float()
+        finding_targets = torch.randint(
+            0, 2, (self.batch_size, self.anatomies, self.findings)
+        ).float()
+        global_targets = torch.randint(0, 2, (self.batch_size, self.globals)).float()
+        finding_valid = torch.ones_like(finding_targets, dtype=torch.bool)
+        finding_valid[0, 0, 0] = False
+        finding_targets[0, 0, 0] = torch.nan
+
+        output = self.model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+            anatomy_targets=anatomy_targets,
+            finding_targets=finding_targets,
+            global_targets=global_targets,
+            finding_valid_mask=finding_valid,
+            return_loss=True,
+        )
+        output.losses["loss"].backward()
+
+        self.assertEqual(
+            set(output.losses),
+            {
+                "loss",
+                "anatomy_loss",
+                "anatomy_bce_loss",
+                "anatomy_dice_loss",
+                "finding_loss",
+                "global_loss",
+            },
+        )
+        for gradient in (
+            self.model.anatomy_head.query_projection.weight.grad,
+            self.model.finding_head.finding_bias.grad,
+            self.model.evidence_fusion.label_bias.grad,
+        ):
+            self.assertIsNotNone(gradient)
+            self.assertTrue(torch.isfinite(gradient).all())
+        self.assertTrue(
+            all(
+                parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                for parameter in self.model.anatomy_head.parameters()
+            )
+        )
+
+    def test_hierarchy_loss_requires_at_least_one_target(self):
+        with self.assertRaisesRegex(ValueError, "At least one hierarchy target"):
+            self.model.forward_hierarchy(
+                self.pixel_values,
+                self.encoded_anatomy,
+                self.encoded_finding,
+                self.encoded_global,
+                return_loss=True,
+            )
+
 
 class CheckpointMigrationTest(unittest.TestCase):
     def test_released_loss_prefix_is_migrated(self):

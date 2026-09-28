@@ -62,8 +62,9 @@ class AnatomyGroundingHead(nn.Module):
         self.query_projection = nn.Linear(hidden_dim, projection_dim, bias=False)
         self.token_projection = nn.Linear(hidden_dim, projection_dim, bias=False)
         self.log_similarity_scale = nn.Parameter(torch.zeros(1))
-        self.log_attention_temperature = nn.Parameter(
-            torch.tensor(math.log(attention_temperature))
+        self.register_buffer(
+            "log_attention_temperature",
+            torch.tensor(math.log(attention_temperature)),
         )
         self.vlcabs = VLCABS(sim_op="cos", empty_mask_policy=empty_mask_policy)
 

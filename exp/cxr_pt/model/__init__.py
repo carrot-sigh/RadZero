@@ -20,6 +20,7 @@ from .hierarchy import (
     GlobalEvidenceBranch,
 )
 from .hierarchical_modeling import HierarchicalCxrAlignModel, HierarchicalModelOutput
+from .hierarchy_losses import HierarchyLoss, HierarchyLossOutput
 from .modeling import CxrAlignModel
 from .processing import load_processor
 from .vlcabs import VLCABS, VLCABSOutput

@@ -14,6 +14,8 @@ rationale, and affected experiments whenever a design choice is frozen.
 - An empty ROI falls back to full-image attention by default, with a strict error
   mode available for validation.
 - Unknown Chest ImaGenome findings are ignored rather than treated as negative.
+- All hierarchy targets use separate boolean validity masks; source-specific
+  unknown and uncertain values are normalized by the dataset layer.
 - Stage 3 retains a global visual branch, so the model is an evidence-guided
   fusion model rather than a strict finding bottleneck.
 - Fusion uses a sample-and-label-specific gate initialized to equal weighting.
@@ -37,4 +39,4 @@ rationale, and affected experiments whenever a design choice is frozen.
 
 | Date | Decision | Rationale | Experiments affected |
 | --- | --- | --- | --- |
-| TBD | TBD | TBD | TBD |
+| 2026-09-28 | Use explicit validity masks for all hierarchy targets. | Keeps unknown-label handling independent of source encodings and prevents false negatives. | All hierarchy training stages |

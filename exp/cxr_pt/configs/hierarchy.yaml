@@ -15,6 +15,13 @@ model:
       aggregation_num_heads: 8
       aggregation_dropout: 0.0
       empty_mask_policy: all
+      loss:
+        anatomy_weight: 1.0
+        finding_weight: 1.0
+        global_weight: 1.0
+        anatomy_bce_weight: 1.0
+        anatomy_dice_weight: 1.0
+        dice_smooth: 1.0
 
   module_to_update:
     - anatomy_head

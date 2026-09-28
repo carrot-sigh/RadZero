@@ -32,7 +32,7 @@
 
 ## P3 - Training
 
-- [ ] Implement masked anatomy, finding, and global losses.
+- [x] Implement masked anatomy, finding, and global losses.
 - [ ] Add class-imbalance handling without treating unknown labels as negatives.
 - [ ] Train the anatomy head first with the encoders frozen.
 - [ ] Train finding recognition with GT ROI masks.
@@ -53,7 +53,7 @@
 
 - [ ] Test bbox transforms and left/right semantics.
 - [x] Test masked softmax and empty ROIs for finite outputs.
-- [ ] Test that unknown labels do not contribute to losses.
+- [x] Test that unknown labels do not contribute to losses.
 - [x] Test Stage 1 -> Stage 2 -> Stage 3 tensor contracts.
 - [x] Test gradient flow from global loss to the ROI head.
 - [ ] Run a tiny-overfit experiment.

@@ -13,6 +13,7 @@ from .hierarchy import (
     GatedFusionOutput,
     GlobalEvidenceBranch,
 )
+from .hierarchy_losses import HierarchyLoss
 from .modeling import CxrAlignModel
 from .vlcabs import VLCABSOutput
 
@@ -26,6 +27,7 @@ class HierarchicalModelOutput:
     global_evidence: VLCABSOutput
     fusion: GatedFusionOutput
     anatomy_masks_used: torch.Tensor
+    losses: dict = None
 
     @property
     def logits(self):
@@ -56,6 +58,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         )
         attention_temperature = hierarchy_config.get("attention_temperature", 0.07)
         empty_mask_policy = hierarchy_config.get("empty_mask_policy", "all")
+        loss_config = hierarchy_config.get("loss", {})
 
         self.anatomy_head = AnatomyGroundingHead(
             self.hidden_size,
@@ -86,6 +89,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             self.num_global_labels,
             logit_temperature=hierarchy_config.get("global_logit_temperature", 0.07),
         )
+        self.hierarchy_loss = HierarchyLoss(**loss_config)
 
     def forward_hierarchy(
         self,
@@ -100,6 +104,13 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         anatomy_mask_override=None,
         detach_anatomy_masks=False,
         finding_chunk_size=None,
+        anatomy_targets=None,
+        finding_targets=None,
+        global_targets=None,
+        anatomy_valid_mask=None,
+        finding_valid_mask=None,
+        global_valid_mask=None,
+        return_loss=False,
     ):
         vision_outputs = self.forward_vision_model(pixel_values)
         anatomy_queries = self._encode_prompt_bank(
@@ -124,6 +135,13 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             anatomy_mask_override=anatomy_mask_override,
             detach_anatomy_masks=detach_anatomy_masks,
             finding_chunk_size=finding_chunk_size,
+            anatomy_targets=anatomy_targets,
+            finding_targets=finding_targets,
+            global_targets=global_targets,
+            anatomy_valid_mask=anatomy_valid_mask,
+            finding_valid_mask=finding_valid_mask,
+            global_valid_mask=global_valid_mask,
+            return_loss=return_loss,
         )
 
     def forward_hierarchy_from_features(
@@ -140,6 +158,13 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         anatomy_mask_override=None,
         detach_anatomy_masks=False,
         finding_chunk_size=None,
+        anatomy_targets=None,
+        finding_targets=None,
+        global_targets=None,
+        anatomy_valid_mask=None,
+        finding_valid_mask=None,
+        global_valid_mask=None,
+        return_loss=False,
     ):
         self._validate_feature_counts(anatomy_queries, finding_queries, global_queries)
         anatomy = self.anatomy_head(
@@ -183,6 +208,24 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         if vision_outputs is None:
             vision_outputs = {"image_patch_tokens": visual_tokens}
 
+        losses = None
+        if return_loss:
+            losses = self.hierarchy_loss(
+                anatomy.roi_mask_logits,
+                finding.finding_logits,
+                fusion.logits,
+                anatomy_targets=anatomy_targets,
+                finding_targets=finding_targets,
+                global_targets=global_targets,
+                anatomy_valid_mask=anatomy_valid_mask,
+                finding_valid_mask=finding_valid_mask,
+                global_valid_mask=global_valid_mask,
+                anatomy_query_mask=anatomy_query_mask,
+                visual_token_mask=visual_token_mask,
+                finding_pair_mask=finding.pair_mask,
+                global_query_mask=global_query_mask,
+            ).as_dict()
+
         return HierarchicalModelOutput(
             vision_outputs=vision_outputs,
             anatomy=anatomy,
@@ -191,6 +234,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             global_evidence=global_evidence,
             fusion=fusion,
             anatomy_masks_used=anatomy_masks_used,
+            losses=losses,
         )
 
     def _encode_prompt_bank(self, encoded_prompts, expected_count, name):
