@@ -9,6 +9,7 @@ from common.trainer import logger
 from .configuration import CxrAlignConfig
 from .modeling import CxrAlignModel
 from .processing import load_processor
+from .vlcabs import VLCABS, VLCABSOutput
 
 
 def load_model(config, **kwargs):

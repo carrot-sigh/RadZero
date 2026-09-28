@@ -1,10 +1,11 @@
-import math
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from open_clip.loss import ClipLoss, SigLipLoss
+
+from .vlcabs import VLCABS
 
 
 class OpenClipLoss(ClipLoss):
@@ -188,6 +189,7 @@ class SimilarityLogit(nn.Module):
     def __init__(self, sim_op="dot", **kwargs):
         super().__init__()
         self.sim_op = sim_op
+        self.vlcabs = VLCABS(sim_op=sim_op)
 
     def forward(
         self,
@@ -197,45 +199,20 @@ class SimilarityLogit(nn.Module):
         repeat: bool = True,
         **kwargs,
     ):
-        if repeat:
-            query_attn_features = queries.unsqueeze(0).expand(
-                local_tokens.shape[0], queries.shape[0], queries.shape[1]
-            )
-        else:
-            assert queries.dim() == 3
-            query_attn_features = queries
+        if not repeat and queries.dim() != 3:
+            raise ValueError("repeat=False requires queries with shape [B, Q, D].")
 
-        if self.sim_op == "cos":
-            temperature = kwargs.get("temperature")
-            assert temperature is not None
-            denominator = temperature
-            query_attn_features = F.normalize(query_attn_features, p=2, dim=-1)
-            local_tokens = F.normalize(local_tokens, p=2, dim=-1)
-        elif self.sim_op == "dot":
-            denominator = math.sqrt(local_tokens.size(-1))
-        else:
-            raise NotImplementedError
-
-        scores = (
-            torch.bmm(query_attn_features, local_tokens.permute(0, 2, 1)) / denominator
+        outputs = self.vlcabs(
+            queries,
+            local_tokens,
+            spatial_mask=kwargs.get("spatial_mask"),
+            query_mask=kwargs.get("query_mask"),
+            temperature=kwargs.get("temperature"),
         )
-        attn_weights = F.softmax(scores, dim=-1)
-
-        aggregated = torch.matmul(attn_weights, local_tokens)
-
-        query_attn_features = F.normalize(query_attn_features, p=2, dim=-1)
-        aggregated = F.normalize(aggregated, p=2, dim=-1)
-
-        logits = (
-            torch.matmul(query_attn_features.unsqueeze(2), aggregated.unsqueeze(-1))
-            .squeeze(-1)
-            .squeeze(-1)
-        )
-
-        logits = logits.transpose(0, 1)
+        logits = outputs.matching_logits.transpose(0, 1)
 
         if need_attn_weights:
-            attn_scores = [scores]
+            attn_scores = [outputs.similarity_scores]
         else:
             attn_scores = None
 

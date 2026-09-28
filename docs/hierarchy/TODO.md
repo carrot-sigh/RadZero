@@ -20,8 +20,8 @@
 
 ## P2 - Model
 
-- [ ] Refactor VL-CABS to return similarity maps, attention, evidence, and logits.
-- [ ] Add masked-softmax support with an empty-mask fallback.
+- [x] Refactor VL-CABS to return similarity maps, attention, evidence, and logits.
+- [x] Add masked-softmax support with an empty-mask fallback.
 - [ ] Implement the anatomy ROI mask head.
 - [ ] Implement Anatomy-Masked VL-CABS for region-finding pairs.
 - [ ] Add finding-logit temperature and bias.

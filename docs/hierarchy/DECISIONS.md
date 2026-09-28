@@ -7,6 +7,10 @@ rationale, and affected experiments whenever a design choice is frozen.
 
 - V1 excludes Anatomy Token Entanglement.
 - Stage 2 uses masks before softmax.
+- Soft masks act as log-space attention priors; zero-valued positions receive no
+  attention.
+- An empty ROI falls back to full-image attention by default, with a strict error
+  mode available for validation.
 - Unknown Chest ImaGenome findings are ignored rather than treated as negative.
 - Stage 3 retains a global visual branch, so the model is an evidence-guided
   fusion model rather than a strict finding bottleneck.
