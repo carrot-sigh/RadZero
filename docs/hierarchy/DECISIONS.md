@@ -20,6 +20,8 @@ rationale, and affected experiments whenever a design choice is frozen.
 - Training starts with GT anatomy masks and transitions to predicted masks.
 - The original RadZero zero-shot interface remains available for regression and
   ablation experiments.
+- The hierarchy model subclasses RadZero and exposes `forward_hierarchy`; it does
+  not replace the original `forward` or `compute_logits` methods.
 
 ## Open decisions
 

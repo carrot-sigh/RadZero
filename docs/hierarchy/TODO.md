@@ -7,7 +7,7 @@
 - [ ] Define the exact 14 global labels and uncertain-label policy.
 - [ ] Add MIMIC-CXR CheXpert labels to the hierarchy manifests.
 - [x] Verify released checkpoint compatibility (only the loss-module prefix differs).
-- [ ] Add automatic `KeyPhraseAlignmentLoss` -> `RadZeroLoss` checkpoint migration.
+- [x] Add automatic `KeyPhraseAlignmentLoss` -> `RadZeroLoss` checkpoint migration.
 - [ ] Record and lock the working Conda environment.
 
 ## P1 - Dataset pipeline
@@ -27,7 +27,8 @@
 - [x] Add finding-logit temperature and bias.
 - [x] Implement finding evidence aggregation for each global label.
 - [x] Implement the global VL-CABS branch and gated fusion.
-- [ ] Preserve the original RadZero forward and zero-shot inference paths.
+- [x] Wire all hierarchy stages into one model wrapper and experiment config.
+- [x] Preserve the original RadZero forward and zero-shot inference paths.
 
 ## P3 - Training
 

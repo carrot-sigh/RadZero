@@ -4,6 +4,7 @@ import unittest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import MPNetConfig, MPNetModel
 
 from exp.cxr_pt.model.losses import RadZeroLoss, SimilarityLogit
 from exp.cxr_pt.model.modeling import CxrAlignModel
@@ -124,6 +125,36 @@ class ComputeLogitsRegressionTest(unittest.TestCase):
                 torch.testing.assert_close(
                     outputs["similarity_scores"], expected_scores
                 )
+
+
+class TextEncodingRegressionTest(unittest.TestCase):
+    def test_mpnet_mean_pooling_preserves_mixed_precision_dtype(self):
+        text_model = MPNetModel(
+            MPNetConfig(
+                vocab_size=32,
+                hidden_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=16,
+                max_position_embeddings=16,
+            )
+        ).to(torch.bfloat16)
+        harness = type("TextHarness", (), {})()
+        harness.text_model = text_model
+        harness.text_projector = None
+        harness.config = type(
+            "Config",
+            (),
+            {"text_config": type("TextConfig", (), {"use_cls_token": False})()},
+        )()
+        encoded = {
+            "input_ids": torch.tensor([[1, 2, 0], [3, 4, 5]]),
+            "attention_mask": torch.tensor([[1, 1, 0], [1, 1, 1]]),
+        }
+
+        output = CxrAlignModel.forward_text_model(harness, encoded)
+
+        self.assertEqual(output["text_features_wo_l2_norm"].dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

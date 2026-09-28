@@ -6,6 +6,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 
 from common.trainer import logger
 
+from .checkpoint import load_radzero_state_dict
 from .configuration import CxrAlignConfig
 from .hierarchy import (
     AnatomyGroundingHead,
@@ -18,6 +19,7 @@ from .hierarchy import (
     GatedFusionOutput,
     GlobalEvidenceBranch,
 )
+from .hierarchical_modeling import HierarchicalCxrAlignModel, HierarchicalModelOutput
 from .modeling import CxrAlignModel
 from .processing import load_processor
 from .vlcabs import VLCABS, VLCABSOutput
@@ -34,6 +36,12 @@ def load_model(config, **kwargs):
     # prepare model
     logger.info("Build model...")
 
+    pretrained_state_dict = config.get("pretrained_state_dict")
+    if config["pretrained_ckpt"] and pretrained_state_dict:
+        raise ValueError(
+            "pretrained_ckpt and pretrained_state_dict are mutually exclusive."
+        )
+
     # load pretrained model
     if config["pretrained_ckpt"]:
         logger.info(f"Load PreTrainedModel : {config['pretrained_ckpt']}")
@@ -49,6 +57,10 @@ def load_model(config, **kwargs):
 
         # set dtype of model
         model.to(dtype)
+
+    if pretrained_state_dict:
+        logger.info(f"Load RadZero state dict : {pretrained_state_dict}")
+        load_radzero_state_dict(model, pretrained_state_dict)
 
     # load adapter & trained parameters
     if config["adapter_ckpt"]:

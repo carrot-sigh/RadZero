@@ -149,7 +149,7 @@ class CxrAlignModel(BasePreTrainedModel):
                     encoded_input["attention_mask"]
                     .unsqueeze(-1)
                     .expand(token_embeddings.size())
-                    .float()
+                    .to(dtype=token_embeddings.dtype)
                 )
                 text_features = torch.sum(
                     token_embeddings * input_mask_expanded, 1
@@ -194,7 +194,11 @@ class CxrAlignModel(BasePreTrainedModel):
 
             else:
                 text_features = model_output.last_hidden_state
-                mask = encoded_input["attention_mask"].unsqueeze(-1).float()
+                mask = (
+                    encoded_input["attention_mask"]
+                    .unsqueeze(-1)
+                    .to(dtype=text_features.dtype)
+                )
                 text_features = torch.sum(text_features * mask, dim=1) / torch.clamp(
                     mask.sum(dim=1), min=1e-9
                 )
