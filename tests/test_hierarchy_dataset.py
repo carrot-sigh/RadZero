@@ -12,6 +12,7 @@ from exp.cxr_pt.hierarchy_contract import build_hierarchy_contract
 from exp.cxr_pt.hierarchy_dataset import (
     HierarchyJsonlDataset,
     build_hierarchy_manifest,
+    compute_anatomy_pos_weights,
     hierarchy_collate_fn,
     rasterize_box,
 )
@@ -99,6 +100,35 @@ class HierarchyDatasetTest(unittest.TestCase):
         self.assertEqual(batch["gt_anatomy_masks"].shape, (1, 2, 16))
         self.assertEqual(batch["compatibility_mask"].tolist(), [[True], [True]])
         self.assertEqual(batch["encoded_global_prompts"]["input_ids"].shape, (3, 1))
+
+    def test_anatomy_weights_use_rasterized_train_pixels(self):
+        manifest = self.root / "weights.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "split": "train",
+                    "image": "p1/p1/s10/train-image.jpg",
+                    "boxes": {"lung": [0, 0, 50, 50]},
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "split": "valid",
+                    "image": "p2/p2/s20/test-image.jpg",
+                    "boxes": {"lung": [0, 0, 100, 100]},
+                }
+            )
+            + "\n"
+        )
+        stats = compute_anatomy_pos_weights(
+            manifest, self.image_root, self.contract_path, "train", 4
+        )
+        self.assertEqual(stats["num_images"], 1)
+        self.assertEqual(stats["positive_pixels"][0], 4)
+        self.assertEqual(stats["negative_pixels"][0], 12)
+        self.assertEqual(stats["suggested_pos_weight"][0], 13 / 5)
+        self.assertIsNone(stats["suggested_pos_weight"][1])
 
     def test_rasterize_box_clips_to_patch_grid(self):
         mask = rasterize_box([-10, 25, 75, 120], 100, 100, 4, 4)

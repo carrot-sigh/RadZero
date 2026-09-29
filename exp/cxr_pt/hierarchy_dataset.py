@@ -260,6 +260,58 @@ class HierarchyJsonlDataset(Dataset):
         }
 
 
+def compute_anatomy_pos_weights(
+    manifest_path,
+    image_root,
+    contract_path,
+    split,
+    patch_grid_size,
+    image_size_index=None,
+):
+    """Compute Laplace-smoothed anatomy pixel weights for one manifest split."""
+    contract = load_hierarchy_contract(contract_path)
+    labels = contract["anatomy"]["labels"]
+    label_index = {label: index for index, label in enumerate(labels)}
+    if isinstance(patch_grid_size, int):
+        patch_grid_size = (patch_grid_size, patch_grid_size)
+    grid_height, grid_width = patch_grid_size
+    positive = np.zeros(len(labels), dtype=np.int64)
+    valid = np.zeros(len(labels), dtype=np.int64)
+    image_root = Path(image_root)
+    num_rows = 0
+    with Path(manifest_path).open() as source:
+        for line in source:
+            row = json.loads(line)
+            if row["split"] != split:
+                continue
+            num_rows += 1
+            if image_size_index is None:
+                with Image.open(image_root / row["image"]) as image:
+                    width, height = image.size
+            else:
+                width, height = image_size_index[row["dicom_id"]]
+            for label, box in row["boxes"].items():
+                index = label_index[label]
+                mask = rasterize_box(box, width, height, grid_width, grid_height)
+                positive[index] += int(mask.sum().item())
+                valid[index] += mask.numel()
+    negative = valid - positive
+    weights = [
+        float((negative[index] + 1) / (positive[index] + 1)) if valid[index] else None
+        for index in range(len(labels))
+    ]
+    return {
+        "split": split,
+        "patch_grid_size": [grid_height, grid_width],
+        "num_images": num_rows,
+        "positive_pixels": positive.tolist(),
+        "negative_pixels": negative.tolist(),
+        "valid_pixels": valid.tolist(),
+        "suggested_pos_weight": weights,
+        "pos_weight_policy": "(negative + 1) / (positive + 1), rasterized train masks only",
+    }
+
+
 def rasterize_box(box, image_width, image_height, grid_width, grid_height):
     x1, y1, x2, y2 = box
     left = max(0, min(grid_width, math.floor(x1 / image_width * grid_width)))

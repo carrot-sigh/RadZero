@@ -7,7 +7,7 @@
 - [x] Define the exact 14 global labels and uncertain-label policy.
 - [x] Add MIMIC-CXR CheXpert labels to the hierarchy manifest.
 - [x] Compute finding/global positive-class weights from the training split only.
-- [ ] Compute anatomy positive-class weights after patch-mask rasterization.
+- [x] Compute anatomy positive-class weights after patch-mask rasterization.
 - [x] Verify released checkpoint compatibility (only the loss-module prefix differs).
 - [x] Add automatic `KeyPhraseAlignmentLoss` -> `RadZeroLoss` checkpoint migration.
 - [ ] Record and lock the working Conda environment.

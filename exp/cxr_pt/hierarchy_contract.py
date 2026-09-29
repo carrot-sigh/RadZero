@@ -187,6 +187,12 @@ def validate_hierarchy_contract(contract):
         ):
             raise ValueError(f"{key} does not match compatibility shape.")
 
+    if len(contract["anatomy"].get("suggested_pos_weight", [])) not in (
+        0,
+        len(anatomies),
+    ):
+        raise ValueError("anatomy positive weights do not match its labels.")
+
     for name in ("finding", "global"):
         if len(contract[name]["suggested_pos_weight"]) != len(contract[name]["labels"]):
             raise ValueError(f"{name} positive weights do not match its labels.")

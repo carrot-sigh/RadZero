@@ -23,7 +23,7 @@ starting the next one.
 - [x] Freeze the 36x41 anatomy-finding compatibility matrix.
 - [x] Freeze the 14 global labels and uncertain-label policy.
 - [x] Compute finding/global positive-class weights from the training split only.
-- [ ] Compute anatomy positive-class weights after patch-mask rasterization.
+- [x] Compute anatomy positive-class weights after patch-mask rasterization.
 
 The versioned source of truth is
 `exp/cxr_pt/configs/hierarchy_contract.json`. Anatomy weights remain part of the
