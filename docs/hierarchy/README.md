@@ -13,6 +13,7 @@ Interpretation project built on RadZero.
 - [DATA_AUDIT.md](DATA_AUDIT.md): available inputs and current data blockers.
 - `exp/cxr_pt/hierarchy_contract.py`: reproducible label-contract builder.
 - `exp/cxr_pt/hierarchy_dataset.py`: manifest builder, dataset, and collator.
+- `exp/cxr_pt/hierarchy_metrics.py`: validity-aware hierarchy metrics.
 - Original research proposal: `/home/user/gxq/idea.md`.
 
 Keep experimental results and generated datasets outside Git. Record their paths,

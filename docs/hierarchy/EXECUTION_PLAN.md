@@ -37,6 +37,10 @@ data-pipeline stage because they depend on the final patch-mask resolution.
 - [x] Disable horizontal flips for V1 to preserve left/right semantics.
 - [x] Build a collator with fixed prompt banks and compatibility masks.
 
+The working `radzero` environment is recorded in `environment-radzero.yml`;
+Conda also reports 277 pip-installed packages, so this is a capture of the
+current environment rather than a fully solver-reproducible lockfile.
+
 ## 5. Trainer integration
 
 - [x] Route hierarchy batches through `forward_hierarchy`.
@@ -47,10 +51,10 @@ data-pipeline stage because they depend on the final patch-mask resolution.
 
 ## 6. Evaluation
 
-- [ ] Add anatomy IoU, Dice, and pointing-game metrics.
-- [ ] Add finding AUROC/AUPRC metrics with validity masks.
-- [ ] Add global AUROC/AUPRC/F1 metrics with the frozen uncertain policy.
-- [ ] Export attention maps, finding scores, gates, and evidence usage.
+- [x] Add anatomy IoU, Dice, and pointing-game metrics.
+- [x] Add validity-aware multilabel AUROC/AUPRC metrics for finding/global tasks.
+- [x] Add validity-aware multilabel F1 metrics for finding/global tasks.
+- [x] Add structured export for attention maps, finding scores, gates, and evidence usage.
 
 ## 7. Ablations and final training
 

@@ -10,7 +10,7 @@
 - [x] Compute anatomy positive-class weights after patch-mask rasterization.
 - [x] Verify released checkpoint compatibility (only the loss-module prefix differs).
 - [x] Add automatic `KeyPhraseAlignmentLoss` -> `RadZeroLoss` checkpoint migration.
-- [ ] Record and lock the working Conda environment.
+- [x] Record and lock the working Conda environment.
 
 ## P1 - Dataset pipeline
 
@@ -43,13 +43,13 @@
 
 ## P4 - Evaluation
 
-- [ ] Add anatomy IoU, Dice, and pointing-game metrics.
-- [ ] Add finding-level AUROC/AUPRC metrics.
-- [ ] Add 14-label AUROC/AUPRC/F1 metrics.
+- [x] Add anatomy IoU, Dice, and pointing-game metrics.
+- [x] Add validity-aware finding/global AUROC/AUPRC metrics.
+- [x] Add validity-aware 14-label F1 metrics.
 - [ ] Compare GT, predicted, shuffled, and full-image ROI masks.
 - [ ] Compare finding-only, global-only, and fused predictions.
 - [ ] Add evidence zero-out and shuffle interventions.
-- [ ] Save attention maps, finding scores, evidence usage, and gate values.
+- [x] Add structured export for attention maps, finding scores, evidence usage, and gate values.
 
 ## P5 - Verification
 
