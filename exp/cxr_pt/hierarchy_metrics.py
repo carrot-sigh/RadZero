@@ -198,3 +198,93 @@ def export_hierarchy_output(output):
         "finding_null_attention": output.finding_aggregation.null_attention.detach(),
         "fused_evidence": output.fusion.fused_evidence.detach(),
     }
+
+
+def evaluate_hierarchy_loader(model, dataloader, device=None):
+    """Run validity-aware hierarchy evaluation over a DataLoader."""
+    was_training = model.training
+    model.eval()
+    collected = {name: [] for name in ("anatomy", "finding", "global")}
+    try:
+        with torch.no_grad():
+            for batch in dataloader:
+                if device is not None:
+                    batch = {
+                        key: value.to(device) if torch.is_tensor(value) else value
+                        for key, value in batch.items()
+                    }
+                output = model.forward_hierarchy(return_loss=False, **batch)
+                collected["anatomy"].append(
+                    (
+                        output.anatomy.roi_masks.detach().cpu(),
+                        batch["anatomy_targets"].detach().cpu(),
+                        batch.get("anatomy_valid_mask"),
+                    )
+                )
+                collected["finding"].append(
+                    (
+                        output.finding.finding_logits.detach().cpu(),
+                        batch["finding_targets"].detach().cpu(),
+                        batch.get("finding_valid_mask"),
+                    )
+                )
+                collected["global"].append(
+                    (
+                        output.fusion.logits.detach().cpu(),
+                        batch["global_targets"].detach().cpu(),
+                        batch.get("global_valid_mask"),
+                    )
+                )
+    finally:
+        model.train(was_training)
+
+    if not collected["global"]:
+        raise ValueError("Cannot evaluate an empty hierarchy dataloader.")
+    anatomy_predictions = torch.cat([item[0] for item in collected["anatomy"]])
+    anatomy_targets = torch.cat([item[1] for item in collected["anatomy"]])
+    anatomy_valid = _concat_optional_masks([item[2] for item in collected["anatomy"]])
+    finding_predictions = torch.cat([item[0] for item in collected["finding"]])
+    finding_targets = torch.cat([item[1] for item in collected["finding"]])
+    finding_valid = _concat_optional_masks([item[2] for item in collected["finding"]])
+    global_predictions = torch.cat([item[0] for item in collected["global"]])
+    global_targets = torch.cat([item[1] for item in collected["global"]])
+    global_valid = _concat_optional_masks([item[2] for item in collected["global"]])
+
+    class Output:
+        pass
+
+    output = Output()
+    output.anatomy = type("Anatomy", (), {"roi_masks": anatomy_predictions})
+    output.finding = type("Finding", (), {"finding_logits": finding_predictions})
+    output.fusion = type("Fusion", (), {"logits": global_predictions})
+    metrics = evaluate_hierarchy_output(
+        output,
+        anatomy_targets=anatomy_targets,
+        finding_targets=finding_targets,
+        global_targets=global_targets,
+        anatomy_valid_mask=anatomy_valid,
+        finding_valid_mask=finding_valid,
+        global_valid_mask=global_valid,
+        grid_shape=_infer_grid_shape(anatomy_targets),
+    )
+    return {key: _metric_value(value) for key, value in metrics.items()}
+
+
+def _concat_optional_masks(masks):
+    if any(mask is None for mask in masks):
+        return None
+    return torch.cat([mask.detach().cpu() for mask in masks])
+
+
+def _infer_grid_shape(targets):
+    token_count = targets.size(-1)
+    side = int(token_count**0.5)
+    if side * side != token_count:
+        raise ValueError(
+            "Flattened anatomy targets must represent a square patch grid."
+        )
+    return side, side
+
+
+def _metric_value(value):
+    return float(value.item()) if torch.is_tensor(value) else float(value)
