@@ -21,6 +21,7 @@ from .hierarchy import (
 )
 from .hierarchical_modeling import HierarchicalCxrAlignModel, HierarchicalModelOutput
 from .hierarchy_losses import HierarchyLoss, HierarchyLossOutput
+from .hierarchy_training import HierarchyTrainingController
 from .modeling import CxrAlignModel
 from .processing import load_processor
 from .vlcabs import VLCABS, VLCABSOutput
@@ -76,6 +77,8 @@ def load_model(config, **kwargs):
     output["model"] = apply_params_setting(
         config, output["model"], output_dir=kwargs["output_dir"]
     )
+    if hasattr(output["model"], "configure_hierarchy_training"):
+        output["model"].configure_hierarchy_training()
 
     return output
 
@@ -95,7 +98,7 @@ def set_trainable_parameters(model, module_to_update: List[str] = None):
             logger.info(f"{model_name} model does not exist in model.")
             continue
 
-        if type(model.__getattr__(model_name)) == torch.nn.parameter.Parameter:
+        if isinstance(model.__getattr__(model_name), torch.nn.parameter.Parameter):
             model.__getattr__(model_name).requires_grad = True
         else:
             for param in model.__getattr__(model_name).parameters():
@@ -108,8 +111,8 @@ def apply_params_setting(config, model, output_dir=None):
 
     # apply lora if requested
     if config["lora_config"]["use_lora"]:
-        assert (
-            type(model) != PeftModel
+        assert not isinstance(
+            model, PeftModel
         ), "model is already PeftModel with adapter. Please check the model configs"
 
         # LoRA

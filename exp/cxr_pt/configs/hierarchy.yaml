@@ -3,9 +3,9 @@ model:
 
   model_config:
     hierarchy_config:
-      # Provisional V1 dimensions; vocabulary files will be frozen separately.
-      num_anatomies: 25
-      num_findings: 43
+      contract_path: exp/cxr_pt/configs/hierarchy_contract.json
+      num_anatomies: 36
+      num_findings: 41
       num_global_labels: 14
       anatomy_projection_dim: 256
       attention_temperature: 0.07
@@ -22,6 +22,18 @@ model:
         anatomy_bce_weight: 1.0
         anatomy_dice_weight: 1.0
         dice_smooth: 1.0
+        # Anatomy weights require rasterized mask statistics. Finding/global
+        # suggestions are frozen in hierarchy_contract.json for trainer loading.
+        anatomy_pos_weight: null
+        finding_pos_weight: null
+        global_pos_weight: null
+      training:
+        initial_stage: anatomy
+        joint_train_encoders: false
+        teacher_forcing_start_ratio: 1.0
+        teacher_forcing_end_ratio: 0.0
+        teacher_forcing_start_step: 0
+        teacher_forcing_end_step: 10000
 
   module_to_update:
     - anatomy_head

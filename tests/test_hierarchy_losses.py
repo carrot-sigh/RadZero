@@ -1,6 +1,7 @@
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from exp.cxr_pt.model.hierarchy_losses import HierarchyLoss
 
@@ -26,7 +27,11 @@ class HierarchyLossTest(unittest.TestCase):
         self.anatomy_targets[0, 1, 2] = torch.nan
         self.finding_targets[1, 2, 3] = -1
         self.global_targets[0, 4] = torch.nan
-        loss_fn = HierarchyLoss()
+        loss_fn = HierarchyLoss(
+            anatomy_pos_weight=[1.0, 2.0, 3.0],
+            finding_pos_weight=[1.0, 2.0, 3.0, 4.0],
+            global_pos_weight=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
         output = loss_fn(
             self.anatomy_logits,
             self.finding_logits,
@@ -145,6 +150,54 @@ class HierarchyLossTest(unittest.TestCase):
             output.anatomy_loss,
             0.5 * output.anatomy_bce_loss + 1.5 * output.anatomy_dice_loss,
         )
+
+    def test_per_class_positive_weights_match_pytorch_reference(self):
+        anatomy_weight = torch.tensor([1.0, 2.0, 3.0])
+        finding_weight = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        global_weight = torch.arange(1.0, 7.0)
+        output = HierarchyLoss(
+            anatomy_pos_weight=anatomy_weight,
+            finding_pos_weight=finding_weight,
+            global_pos_weight=global_weight,
+        )(
+            self.anatomy_logits,
+            self.finding_logits,
+            self.global_logits,
+            anatomy_targets=self.anatomy_targets,
+            finding_targets=self.finding_targets,
+            global_targets=self.global_targets,
+        )
+
+        expected_anatomy_bce = F.binary_cross_entropy_with_logits(
+            self.anatomy_logits,
+            self.anatomy_targets,
+            pos_weight=anatomy_weight.view(1, -1, 1),
+        )
+        expected_finding = F.binary_cross_entropy_with_logits(
+            self.finding_logits,
+            self.finding_targets,
+            pos_weight=finding_weight,
+        )
+        expected_global = F.binary_cross_entropy_with_logits(
+            self.global_logits,
+            self.global_targets,
+            pos_weight=global_weight,
+        )
+
+        torch.testing.assert_close(output.anatomy_bce_loss, expected_anatomy_bce)
+        torch.testing.assert_close(output.finding_loss, expected_finding)
+        torch.testing.assert_close(output.global_loss, expected_global)
+
+    def test_positive_weights_validate_values_and_class_count(self):
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            HierarchyLoss(global_pos_weight=[1.0, 0.0])
+        with self.assertRaisesRegex(ValueError, "1 or 6 values"):
+            HierarchyLoss(global_pos_weight=[1.0, 2.0])(
+                self.anatomy_logits,
+                self.finding_logits,
+                self.global_logits,
+                global_targets=self.global_targets,
+            )
 
     def test_invalid_labeled_target_is_rejected(self):
         self.global_targets[0, 0] = -1

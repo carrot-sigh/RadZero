@@ -2,21 +2,23 @@
 
 ## P0 - Contracts and data
 
-- [ ] Freeze the anatomy vocabulary; use bbox-supervised regions for V1.
-- [ ] Freeze the finding vocabulary and anatomy-finding compatibility matrix.
-- [ ] Define the exact 14 global labels and uncertain-label policy.
-- [ ] Add MIMIC-CXR CheXpert labels to the hierarchy manifests.
+- [x] Freeze the anatomy vocabulary; use 36 bbox-supervised regions for V1.
+- [x] Freeze the 41-label finding vocabulary and 36x41 compatibility matrix.
+- [x] Define the exact 14 global labels and uncertain-label policy.
+- [x] Add MIMIC-CXR CheXpert labels to the hierarchy manifest.
+- [x] Compute finding/global positive-class weights from the training split only.
+- [ ] Compute anatomy positive-class weights after patch-mask rasterization.
 - [x] Verify released checkpoint compatibility (only the loss-module prefix differs).
 - [x] Add automatic `KeyPhraseAlignmentLoss` -> `RadZeroLoss` checkpoint migration.
 - [ ] Record and lock the working Conda environment.
 
 ## P1 - Dataset pipeline
 
-- [ ] Add a hierarchy dataset backed by the existing Parquet manifests.
-- [ ] Return anatomy boxes, finding targets, global targets, and validity masks.
-- [ ] Implement joint image/bbox transforms.
-- [ ] Handle left/right label swaps during horizontal flips, or disable flips.
-- [ ] Add dataset schema and split-integrity checks.
+- [x] Add a random-access hierarchy dataset backed by a generated JSONL manifest.
+- [x] Return anatomy masks, finding targets, global targets, and validity masks.
+- [x] Rasterize original-coordinate boxes consistently with direct image resize.
+- [x] Disable horizontal flips for V1 to preserve left/right semantics.
+- [x] Add dataset schema, split-integrity, and real-data coverage checks.
 
 ## P2 - Model
 
@@ -33,10 +35,10 @@
 ## P3 - Training
 
 - [x] Implement masked anatomy, finding, and global losses.
-- [ ] Add class-imbalance handling without treating unknown labels as negatives.
+- [x] Add configurable class-imbalance handling after validity masking.
 - [ ] Train the anatomy head first with the encoders frozen.
 - [ ] Train finding recognition with GT ROI masks.
-- [ ] Introduce predicted masks with scheduled teacher forcing.
+- [x] Add predicted-mask teacher-forcing scheduling and checkpoint state.
 - [ ] Train Stage 3, then run low-learning-rate joint fine-tuning.
 
 ## P4 - Evaluation

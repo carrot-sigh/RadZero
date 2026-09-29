@@ -14,6 +14,7 @@ from .hierarchy import (
     GlobalEvidenceBranch,
 )
 from .hierarchy_losses import HierarchyLoss
+from .hierarchy_training import HierarchyTrainingController
 from .modeling import CxrAlignModel
 from .vlcabs import VLCABSOutput
 
@@ -43,6 +44,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         "finding_aggregator.",
         "global_branch.",
         "evidence_fusion.",
+        "training_controller.",
     )
 
     def __init__(self, config):
@@ -59,6 +61,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         attention_temperature = hierarchy_config.get("attention_temperature", 0.07)
         empty_mask_policy = hierarchy_config.get("empty_mask_policy", "all")
         loss_config = hierarchy_config.get("loss", {})
+        training_config = hierarchy_config.get("training", {})
 
         self.anatomy_head = AnatomyGroundingHead(
             self.hidden_size,
@@ -90,6 +93,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             logit_temperature=hierarchy_config.get("global_logit_temperature", 0.07),
         )
         self.hierarchy_loss = HierarchyLoss(**loss_config)
+        self.training_controller = HierarchyTrainingController(**training_config)
 
     def forward_hierarchy(
         self,
@@ -102,6 +106,8 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         visual_token_mask=None,
         compatibility_mask=None,
         anatomy_mask_override=None,
+        gt_anatomy_masks=None,
+        teacher_forcing_ratio=None,
         detach_anatomy_masks=False,
         finding_chunk_size=None,
         anatomy_targets=None,
@@ -133,6 +139,8 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             visual_token_mask=visual_token_mask,
             compatibility_mask=compatibility_mask,
             anatomy_mask_override=anatomy_mask_override,
+            gt_anatomy_masks=gt_anatomy_masks,
+            teacher_forcing_ratio=teacher_forcing_ratio,
             detach_anatomy_masks=detach_anatomy_masks,
             finding_chunk_size=finding_chunk_size,
             anatomy_targets=anatomy_targets,
@@ -156,6 +164,8 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         visual_token_mask=None,
         compatibility_mask=None,
         anatomy_mask_override=None,
+        gt_anatomy_masks=None,
+        teacher_forcing_ratio=None,
         detach_anatomy_masks=False,
         finding_chunk_size=None,
         anatomy_targets=None,
@@ -173,9 +183,11 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             anatomy_query_mask=anatomy_query_mask,
             visual_token_mask=visual_token_mask,
         )
-        anatomy_masks_used = self._select_anatomy_masks(
+        anatomy_masks_used = self._resolve_anatomy_masks(
             anatomy.roi_masks,
             anatomy_mask_override,
+            gt_anatomy_masks,
+            teacher_forcing_ratio,
             detach_anatomy_masks,
         )
         finding = self.finding_head(
@@ -280,6 +292,38 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         if detach:
             masks = masks.detach()
         return masks
+
+    def _resolve_anatomy_masks(
+        self,
+        predicted_masks,
+        override,
+        ground_truth_masks,
+        teacher_forcing_ratio,
+        detach,
+    ):
+        if override is not None and (
+            ground_truth_masks is not None or teacher_forcing_ratio is not None
+        ):
+            raise ValueError(
+                "anatomy_mask_override cannot be combined with teacher forcing."
+            )
+        if override is None:
+            override = self.training_controller.select_anatomy_masks(
+                predicted_masks,
+                ground_truth_masks,
+                training=self.training,
+                ratio=teacher_forcing_ratio,
+            )
+        return self._select_anatomy_masks(predicted_masks, override, detach)
+
+    def configure_hierarchy_training(self, stage=None):
+        return self.training_controller.configure_model(self, stage=stage)
+
+    def set_hierarchy_training_step(self, step):
+        self.training_controller.set_step(step)
+
+    def get_teacher_forcing_ratio(self, step=None):
+        return self.training_controller.teacher_forcing_ratio(step)
 
     @staticmethod
     def _positive_int(config, name):

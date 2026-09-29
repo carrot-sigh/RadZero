@@ -20,23 +20,35 @@ rationale, and affected experiments whenever a design choice is frozen.
   fusion model rather than a strict finding bottleneck.
 - Fusion uses a sample-and-label-specific gate initialized to equal weighting.
 - Training starts with GT anatomy masks and transitions to predicted masks.
+- Training uses explicit anatomy, finding, global, and joint stages; encoders are
+  frozen by default, including during joint hierarchy training.
 - The original RadZero zero-shot interface remains available for regression and
   ablation experiments.
 - The hierarchy model subclasses RadZero and exposes `forward_hierarchy`; it does
   not replace the original `forward` or `compute_logits` methods.
+- V1 uses the 36 official bbox-detectable Chest ImaGenome anatomy regions.
+- V1 uses 41 explicitly supervised region findings; `rib fracture` and
+  `subcutaneous air` are excluded from the regional vocabulary.
+- Region-finding compatibility is learned from non-conflicting explicit labels
+  in the Chest ImaGenome training split only.
+- Global targets use the 14 CheXpert labels. Values `-1.0` and blank are ignored;
+  blank `No Finding` becomes negative only when another label is positive.
+- The official Chest ImaGenome split is canonical for every hierarchy task;
+  MIMIC split assignments are audit metadata only.
 
 ## Open decisions
 
-- [ ] Exact anatomy vocabulary and whether to include regions without bbox.
-- [ ] Exact global 14-label vocabulary.
-- [ ] CheXpert uncertain-label policy.
+- [x] Exact anatomy vocabulary and whether to include regions without bbox.
+- [x] Exact global 14-label vocabulary.
+- [x] CheXpert uncertain-label policy.
 - [x] Direct patch-mask prediction versus auxiliary bbox regression.
 - [x] Static versus sample-dependent label-specific fusion gate.
 - [ ] Prompt templates and prompt ensembling policy.
-- [ ] Encoder freezing and unfreezing schedule.
+- [x] Encoder freezing and unfreezing schedule.
 
 ## Decision log
 
 | Date | Decision | Rationale | Experiments affected |
 | --- | --- | --- | --- |
 | 2026-09-28 | Use explicit validity masks for all hierarchy targets. | Keeps unknown-label handling independent of source encodings and prevents false negatives. | All hierarchy training stages |
+| 2026-09-28 | Freeze the V1 labels and compatibility matrix from official training splits. | Prevents vocabulary drift and validation/test leakage. | Data, training, and evaluation |

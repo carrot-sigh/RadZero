@@ -29,6 +29,9 @@ class HierarchyLoss(nn.Module):
         anatomy_bce_weight=1.0,
         anatomy_dice_weight=1.0,
         dice_smooth=1.0,
+        anatomy_pos_weight=None,
+        finding_pos_weight=None,
+        global_pos_weight=None,
     ):
         super().__init__()
         weights = {
@@ -50,6 +53,21 @@ class HierarchyLoss(nn.Module):
         self.anatomy_bce_weight = anatomy_bce_weight
         self.anatomy_dice_weight = anatomy_dice_weight
         self.dice_smooth = dice_smooth
+        self.register_buffer(
+            "anatomy_pos_weight",
+            self._prepare_pos_weight(anatomy_pos_weight, "anatomy_pos_weight"),
+            persistent=False,
+        )
+        self.register_buffer(
+            "finding_pos_weight",
+            self._prepare_pos_weight(finding_pos_weight, "finding_pos_weight"),
+            persistent=False,
+        )
+        self.register_buffer(
+            "global_pos_weight",
+            self._prepare_pos_weight(global_pos_weight, "global_pos_weight"),
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -83,7 +101,12 @@ class HierarchyLoss(nn.Module):
                 visual_token_mask,
             )
             anatomy_bce = self._masked_bce_with_logits(
-                anatomy_logits, anatomy_targets, valid_mask, "anatomy"
+                anatomy_logits,
+                anatomy_targets,
+                valid_mask,
+                "anatomy",
+                self.anatomy_pos_weight,
+                class_axis=1,
             )
             anatomy_dice = self._masked_dice_loss(
                 anatomy_logits, anatomy_targets, valid_mask, "anatomy"
@@ -107,7 +130,12 @@ class HierarchyLoss(nn.Module):
                 "finding",
             )
             finding_loss = self._masked_bce_with_logits(
-                finding_logits, finding_targets, valid_mask, "finding"
+                finding_logits,
+                finding_targets,
+                valid_mask,
+                "finding",
+                self.finding_pos_weight,
+                class_axis=2,
             )
             output["finding_loss"] = finding_loss
             weighted = self.finding_weight * finding_loss
@@ -127,7 +155,12 @@ class HierarchyLoss(nn.Module):
                 "global",
             )
             global_loss = self._masked_bce_with_logits(
-                global_logits, global_targets, valid_mask, "global"
+                global_logits,
+                global_targets,
+                valid_mask,
+                "global",
+                self.global_pos_weight,
+                class_axis=1,
             )
             output["global_loss"] = global_loss
             weighted = self.global_weight * global_loss
@@ -183,14 +216,47 @@ class HierarchyLoss(nn.Module):
             )
         return valid
 
-    @staticmethod
-    def _masked_bce_with_logits(logits, targets, valid_mask, name):
-        targets = HierarchyLoss._prepare_targets(targets, logits, valid_mask, name)
+    def _masked_bce_with_logits(
+        self, logits, targets, valid_mask, name, pos_weight, class_axis
+    ):
+        targets = self._prepare_targets(targets, logits, valid_mask, name)
         if not valid_mask.any():
             return logits.sum() * 0.0
-        return F.binary_cross_entropy_with_logits(
-            logits[valid_mask].float(), targets[valid_mask].float()
+        selected_pos_weight = self._select_pos_weight(
+            pos_weight, logits, valid_mask, name, class_axis
         )
+        return F.binary_cross_entropy_with_logits(
+            logits[valid_mask].float(),
+            targets[valid_mask].float(),
+            pos_weight=selected_pos_weight,
+        )
+
+    @staticmethod
+    def _prepare_pos_weight(value, name):
+        if value is None:
+            return None
+        weight = torch.as_tensor(value, dtype=torch.float32)
+        if weight.dim() > 1 or weight.numel() == 0:
+            raise ValueError(f"{name} must be a scalar or one-dimensional sequence.")
+        if not torch.isfinite(weight).all() or torch.any(weight <= 0):
+            raise ValueError(f"{name} values must be finite and positive.")
+        return weight
+
+    @staticmethod
+    def _select_pos_weight(pos_weight, logits, valid_mask, name, class_axis):
+        if pos_weight is None:
+            return None
+        pos_weight = pos_weight.to(device=logits.device, dtype=torch.float32)
+        if pos_weight.numel() == 1:
+            return pos_weight.reshape(())
+        class_count = logits.size(class_axis)
+        if pos_weight.numel() != class_count:
+            raise ValueError(
+                f"{name}_pos_weight must contain 1 or {class_count} values."
+            )
+        shape = [1] * logits.dim()
+        shape[class_axis] = class_count
+        return pos_weight.reshape(shape).expand(logits.shape)[valid_mask]
 
     def _masked_dice_loss(self, logits, targets, valid_mask, name):
         targets = self._prepare_targets(targets, logits, valid_mask, name)
