@@ -42,8 +42,8 @@ data-pipeline stage because they depend on the final patch-mask resolution.
 - [x] Route hierarchy batches through `forward_hierarchy`.
 - [x] Log each component loss, stage index, and teacher-forcing ratio.
 - [x] Run one-batch forward/backward gradient-flow tests.
-- [ ] Run full Trainer checkpoint-resume tests.
-- [ ] Run a deterministic tiny-overfit experiment.
+- [x] Run hierarchy checkpoint-resume tests for stage and global-step state.
+- [x] Run a deterministic synthetic tiny-overfit experiment.
 
 ## 6. Evaluation
 

@@ -24,6 +24,58 @@ class HierarchyTrainerTest(unittest.TestCase):
             "anatomy_valid_mask": torch.ones(batch_size, 3, dtype=torch.bool),
         }
 
+    def test_checkpoint_restores_stage_and_trainer_step(self):
+        self.model.configure_hierarchy_training("finding")
+        self.model.set_hierarchy_training_step(4321)
+        state = self.model.state_dict()
+
+        restored = HierarchyHarness(make_config(anatomies=3, findings=4, globals_=5))
+        restored.load_state_dict(state)
+        restored_trainer = object.__new__(CXRPreTrainer)
+        restored_trainer.state = SimpleNamespace(global_step=4321)
+        restored_inputs = dict(self.inputs)
+        restored_inputs["gt_anatomy_masks"] = restored_inputs["anatomy_targets"]
+        restored_inputs["finding_targets"] = torch.randint(0, 2, (2, 3, 4)).float()
+        restored_inputs["finding_valid_mask"] = torch.ones(2, 3, 4, dtype=torch.bool)
+
+        _, outputs = restored_trainer.compute_loss(
+            restored, restored_inputs, return_outputs=True
+        )
+        self.assertEqual(restored.training_controller.stage, "finding")
+        self.assertEqual(restored.training_controller.step.item(), 4321)
+        self.assertIn("finding_loss", outputs["losses"])
+        self.assertAlmostEqual(
+            outputs["losses"]["teacher_forcing_ratio"].item(), 0.5679, places=4
+        )
+
+    def test_tiny_anatomy_overfit_reduces_loss(self):
+        torch.manual_seed(67)
+        self.model.configure_hierarchy_training("anatomy")
+        inputs = dict(self.inputs)
+        inputs["anatomy_targets"] = torch.zeros_like(inputs["anatomy_targets"])
+        optimizer = torch.optim.Adam(
+            [
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            ],
+            lr=0.05,
+        )
+        initial_loss = None
+        minimum_loss = None
+        for step in range(120):
+            self.trainer.state.global_step = step
+            optimizer.zero_grad()
+            loss = self.trainer.compute_loss(self.model, inputs)
+            if initial_loss is None:
+                initial_loss = loss.item()
+            loss.backward()
+            optimizer.step()
+            minimum_loss = (
+                loss.item() if minimum_loss is None else min(minimum_loss, loss.item())
+            )
+        self.assertLess(minimum_loss, initial_loss * 0.8)
+
     def test_stage_selects_only_its_supervision_targets(self):
         for stage, expected in (
             (

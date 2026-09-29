@@ -58,5 +58,5 @@
 - [x] Test that unknown labels do not contribute to losses.
 - [x] Test Stage 1 -> Stage 2 -> Stage 3 tensor contracts.
 - [x] Test gradient flow from global loss to the ROI head.
-- [ ] Run a tiny-overfit experiment.
+- [x] Run a deterministic synthetic tiny-overfit experiment.
 - [x] Add a regression test for original RadZero logits and inference shapes.
