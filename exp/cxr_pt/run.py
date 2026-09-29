@@ -10,6 +10,10 @@ from common.code_snapshot import code_snapshot
 from common.trainer import logger
 from common.utils import Config, output_directory_setting, str2bool
 from exp.cxr_pt.dataset import collate_fn, load_datasets
+from exp.cxr_pt.hierarchy_dataset import (
+    HierarchyJsonlDataset,
+    hierarchy_collate_fn,
+)
 from exp.cxr_pt.inference.inference import Inference
 from exp.cxr_pt.model import load_model
 from exp.cxr_pt.trainer import CXRPreTrainer
@@ -89,22 +93,49 @@ def main():
     training_args = TrainingArguments(**cfg["train"], deepspeed=deepspeed)
     models = load_model(cfg["model"], output_dir=cfg["train"]["output_dir"])
 
-    dataset = load_datasets(
-        cfg["dataset"],
-        train=cfg["args"]["train"],
-        inference=False,
-    )
+    is_hierarchy = cfg["model"].get("model_class_name") == "HierarchicalCxrAlignModel"
+    if is_hierarchy:
+        hierarchy_cfg = cfg["dataset"]["hierarchy"]
+        dataset = {
+            "train": HierarchyJsonlDataset(
+                hierarchy_cfg["manifest_path"],
+                hierarchy_cfg["image_root"],
+                hierarchy_cfg["contract_path"],
+                split=hierarchy_cfg.get("train_split", "train"),
+                patch_grid_size=hierarchy_cfg["patch_grid_size"],
+            ),
+            "eval": HierarchyJsonlDataset(
+                hierarchy_cfg["manifest_path"],
+                hierarchy_cfg["image_root"],
+                hierarchy_cfg["contract_path"],
+                split=hierarchy_cfg.get("eval_split", "valid"),
+                patch_grid_size=hierarchy_cfg["patch_grid_size"],
+            ),
+        }
+        data_collator = partial(
+            hierarchy_collate_fn,
+            tokenizer=models["tokenizer"],
+            image_processor=models["image_processor"],
+            contract_path=hierarchy_cfg["contract_path"],
+        )
+    else:
+        dataset = load_datasets(
+            cfg["dataset"],
+            train=cfg["args"]["train"],
+            inference=False,
+        )
+        data_collator = partial(
+            collate_fn,
+            tokenizer=models["tokenizer"],
+            image_processor=models["image_processor"],
+        )
 
     trainer = CXRPreTrainer(
         model=models["model"],
         args=training_args,
         train_dataset=dataset.get("train"),
         eval_dataset=dataset.get("eval"),
-        data_collator=partial(
-            collate_fn,
-            tokenizer=models["tokenizer"],
-            image_processor=models["image_processor"],
-        ),
+        data_collator=data_collator,
         cfg=cfg,
         callbacks=[
             EarlyStoppingCallback(

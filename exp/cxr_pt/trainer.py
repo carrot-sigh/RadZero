@@ -38,6 +38,39 @@ class CXRPreTrainer(BaseTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False):
+        if "encoded_anatomy_prompts" in inputs:
+            if hasattr(model, "set_hierarchy_training_step"):
+                model.set_hierarchy_training_step(int(self.state.global_step))
+            hierarchy_inputs = dict(inputs)
+            controller = getattr(model, "training_controller", None)
+            stage = controller.stage if controller is not None else "joint"
+            if stage == "anatomy":
+                hierarchy_inputs["finding_targets"] = None
+                hierarchy_inputs["global_targets"] = None
+            elif stage == "finding":
+                hierarchy_inputs["anatomy_targets"] = None
+                hierarchy_inputs["global_targets"] = None
+            elif stage == "global":
+                hierarchy_inputs["anatomy_targets"] = None
+                hierarchy_inputs["finding_targets"] = None
+            hierarchy_output = model.forward_hierarchy(
+                return_loss=True,
+                **hierarchy_inputs,
+            )
+            losses = dict(hierarchy_output.losses)
+            if hasattr(model, "get_teacher_forcing_ratio"):
+                losses["teacher_forcing_ratio"] = hierarchy_output.logits.new_tensor(
+                    model.get_teacher_forcing_ratio()
+                )
+            controller = getattr(model, "training_controller", None)
+            if controller is not None:
+                losses["hierarchy_stage_index"] = hierarchy_output.logits.new_tensor(
+                    float(controller.stage_index.item())
+                )
+            outputs = {"logits": hierarchy_output.logits, "losses": losses}
+            loss = losses["loss"]
+            return (loss, outputs) if return_outputs else loss
+
         outputs = model(**inputs)
         losses = outputs.pop("losses")
         loss = losses.pop("loss")

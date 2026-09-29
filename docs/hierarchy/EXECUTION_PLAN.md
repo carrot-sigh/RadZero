@@ -39,9 +39,10 @@ data-pipeline stage because they depend on the final patch-mask resolution.
 
 ## 5. Trainer integration
 
-- [ ] Route hierarchy batches through `forward_hierarchy`.
-- [ ] Log each component loss and teacher-forcing ratio.
-- [ ] Run one-batch forward/backward and checkpoint-resume tests.
+- [x] Route hierarchy batches through `forward_hierarchy`.
+- [x] Log each component loss, stage index, and teacher-forcing ratio.
+- [x] Run one-batch forward/backward gradient-flow tests.
+- [ ] Run full Trainer checkpoint-resume tests.
 - [ ] Run a deterministic tiny-overfit experiment.
 
 ## 6. Evaluation

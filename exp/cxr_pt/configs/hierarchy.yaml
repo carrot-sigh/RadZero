@@ -47,3 +47,12 @@ model:
 
 experiment:
   name: hierarchy
+
+dataset:
+  hierarchy:
+    manifest_path: /home/user/gxq/radzero-data/data/MIMIC-CXR/hierarchy-v1.jsonl
+    image_root: /home/user/gxq/Data/mimic-cxr-jpg-2.1.0/files
+    contract_path: exp/cxr_pt/configs/hierarchy_contract.json
+    patch_grid_size: [37, 37]
+    train_split: train
+    eval_split: valid
