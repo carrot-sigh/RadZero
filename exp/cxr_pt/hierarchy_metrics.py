@@ -210,15 +210,24 @@ def evaluate_hierarchy_loader(model, dataloader, device=None):
             for batch in dataloader:
                 if device is not None:
                     batch = {
-                        key: value.to(device) if torch.is_tensor(value) else value
+                        key: (
+                            value.to(device)
+                            if torch.is_tensor(value) or hasattr(value, "to")
+                            else value
+                        )
                         for key, value in batch.items()
                     }
-                output = model.forward_hierarchy(return_loss=False, **batch)
+                inference_batch = dict(batch)
+                inference_batch.pop("gt_anatomy_masks", None)
+                output = model.forward_hierarchy(return_loss=False, **inference_batch)
                 collected["anatomy"].append(
                     (
                         output.anatomy.roi_masks.detach().cpu(),
                         batch["anatomy_targets"].detach().cpu(),
-                        batch.get("anatomy_valid_mask"),
+                        batch.get(
+                            "anatomy_annotation_mask",
+                            batch.get("anatomy_valid_mask"),
+                        ),
                     )
                 )
                 collected["finding"].append(

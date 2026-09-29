@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 
 import torch
 from safetensors.torch import load_file
@@ -6,6 +7,13 @@ from safetensors.torch import load_file
 
 RELEASED_LOSS_PREFIX = "loss_fns.KeyPhraseAlignmentLoss."
 CURRENT_LOSS_PREFIX = "loss_fns.RadZeroLoss."
+
+
+@dataclass
+class CheckpointLoadResult:
+    missing_keys: list
+    unexpected_keys: list
+    verification_key: str
 
 
 def migrate_released_radzero_state_dict(state_dict):
@@ -47,4 +55,28 @@ def load_radzero_state_dict(model, checkpoint_path):
             f"missing={unexpected_missing}, "
             f"unexpected={incompatible.unexpected_keys}"
         )
-    return incompatible
+    verification_key = next(
+        (
+            key
+            for key in sorted(state_dict)
+            if not key.startswith(allowed_prefixes)
+            and key.endswith(".weight")
+            and state_dict[key].numel() > 1
+        ),
+        None,
+    )
+    if verification_key is None:
+        raise RuntimeError("RadZero checkpoint contains no verifiable base tensor.")
+    loaded_value = model.state_dict()[verification_key]
+    expected_value = state_dict[verification_key].to(
+        device=loaded_value.device, dtype=loaded_value.dtype
+    )
+    if not torch.equal(loaded_value, expected_value):
+        raise RuntimeError(
+            f"RadZero checkpoint verification failed for {verification_key}."
+        )
+    return CheckpointLoadResult(
+        missing_keys=incompatible.missing_keys,
+        unexpected_keys=incompatible.unexpected_keys,
+        verification_key=verification_key,
+    )

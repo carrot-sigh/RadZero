@@ -35,6 +35,14 @@ rationale, and affected experiments whenever a design choice is frozen.
   blank `No Finding` becomes negative only when another label is positive.
 - The official Chest ImaGenome split is canonical for every hierarchy task;
   MIMIC split assignments are audit metadata only.
+- Anatomy ROI prediction and anatomy matching branch from one shared cosine
+  similarity map. The ROI head refines that map; it does not compute a second
+  query-token similarity map.
+- The Stage 3 global visual branch reuses original RadZero VL-CABS inputs:
+  full aligned vision tokens including CLS, RadZero layer norm, and attention
+  temperature.
+- GT anatomy annotation availability controls only loss and metrics. All fixed
+  anatomy queries remain available during train, validation, and test.
 
 ## Open decisions
 
@@ -52,3 +60,5 @@ rationale, and affected experiments whenever a design choice is frozen.
 | --- | --- | --- | --- |
 | 2026-09-28 | Use explicit validity masks for all hierarchy targets. | Keeps unknown-label handling independent of source encodings and prevents false negatives. | All hierarchy training stages |
 | 2026-09-28 | Freeze the V1 labels and compatibility matrix from official training splits. | Prevents vocabulary drift and validation/test leakage. | Data, training, and evaluation |
+| 2026-09-29 | Separate anatomy query availability from annotation availability. | Prevents GT bbox-presence leakage into validation and test predictions. | All hierarchy stages and evaluation |
+| 2026-09-29 | Share the Stage 1 anatomy similarity map and reuse full-token RadZero for the Stage 3 global branch. | Aligns implementation with the frozen research design and preserves a faithful global reference path. | Stage 1 and Stage 3 |

@@ -1,4 +1,5 @@
 import unittest
+from types import MethodType
 from types import SimpleNamespace
 
 import torch
@@ -14,7 +15,7 @@ class HierarchyTrainerTest(unittest.TestCase):
         self.model.configure_hierarchy_training("anatomy")
         self.trainer = object.__new__(CXRPreTrainer)
         self.trainer.state = SimpleNamespace(global_step=17)
-        batch_size, tokens, hidden = 2, 7, 8
+        batch_size, tokens, hidden = 2, 9, 8
         self.inputs = {
             "pixel_values": torch.randn(batch_size, tokens + 1, hidden),
             "encoded_anatomy_prompts": {"features": torch.randn(3, hidden * 2)},
@@ -121,6 +122,70 @@ class HierarchyTrainerTest(unittest.TestCase):
             any(
                 parameter.grad is not None
                 for parameter in self.model.finding_head.parameters()
+            )
+        )
+
+    def test_stage_switch_rebuilds_optimizer_with_new_parameters(self):
+        old_optimizer = torch.optim.SGD(
+            [
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            ],
+            lr=0.01,
+        )
+        self.trainer.model = self.model
+        self.trainer.optimizer = old_optimizer
+        self.trainer.lr_scheduler = object()
+        self.trainer.is_in_train = False
+        self.trainer.callback_handler = SimpleNamespace(
+            optimizer=old_optimizer, lr_scheduler=None
+        )
+
+        def create_optimizer_and_scheduler(trainer, num_training_steps):
+            trainer.optimizer = torch.optim.SGD(
+                [
+                    parameter
+                    for parameter in trainer.model.parameters()
+                    if parameter.requires_grad
+                ],
+                lr=0.01,
+            )
+            trainer.lr_scheduler = SimpleNamespace(
+                num_training_steps=num_training_steps
+            )
+
+        self.trainer.create_optimizer_and_scheduler = MethodType(
+            create_optimizer_and_scheduler, self.trainer
+        )
+        self.trainer.configure_hierarchy_stage("finding", num_training_steps=20)
+        optimizer_ids = {
+            id(parameter)
+            for group in self.trainer.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        expected_ids = {
+            id(parameter)
+            for parameter in self.model.finding_head.parameters()
+            if parameter.requires_grad
+        }
+        self.assertEqual(optimizer_ids, expected_ids)
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in self.model.finding_head.named_parameters()
+        }
+        inputs = dict(self.inputs)
+        inputs["gt_anatomy_masks"] = inputs["anatomy_targets"]
+        inputs["finding_targets"] = torch.randint(0, 2, (2, 3, 4)).float()
+        inputs["finding_valid_mask"] = torch.ones(2, 3, 4, dtype=torch.bool)
+        self.trainer.optimizer.zero_grad()
+        loss = self.trainer.compute_loss(self.model, inputs)
+        loss.backward()
+        self.trainer.optimizer.step()
+        self.assertTrue(
+            all(
+                not torch.equal(before[name], parameter.detach())
+                for name, parameter in self.model.finding_head.named_parameters()
             )
         )
 

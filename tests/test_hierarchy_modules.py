@@ -28,7 +28,7 @@ class HierarchyModulesTest(unittest.TestCase):
         self.global_queries = torch.randn(self.global_count, self.hidden_dim)
 
     def test_anatomy_head_outputs_masks_and_evidence(self):
-        head = AnatomyGroundingHead(self.hidden_dim, projection_dim=4)
+        head = AnatomyGroundingHead(self.hidden_dim)
         anatomy_query_mask = torch.tensor([True, False, True])
         visual_token_mask = torch.tensor(
             [[True] * 6 + [False], [True] * 5 + [False, False]]
@@ -59,6 +59,22 @@ class HierarchyModulesTest(unittest.TestCase):
         self.assertTrue(torch.all(output.attention_weights[:, 1] == 0))
         expanded_token_mask = visual_token_mask.unsqueeze(1).expand_as(output.roi_masks)
         self.assertTrue(torch.all(output.roi_masks[~expanded_token_mask] == 0))
+        valid = expanded_token_mask & anatomy_query_mask.view(1, -1, 1)
+        torch.testing.assert_close(
+            output.roi_mask_logits[valid], output.similarity_scores[valid]
+        )
+
+    def test_anatomy_roi_refiner_consumes_shared_similarity_map(self):
+        head = AnatomyGroundingHead(self.hidden_dim, num_anatomies=self.anatomy_count)
+        visual_tokens = self.visual_tokens[:, :4]
+        output = head(self.anatomy_queries, visual_tokens)
+        scale = head.log_roi_scale.exp().view(1, -1, 1)
+        bias = head.roi_bias.view(1, -1, 1)
+        expected = head._roi_logits_from_similarity(
+            output.similarity_scores, scale, bias
+        )
+
+        torch.testing.assert_close(output.roi_mask_logits, expected)
 
     def test_finding_head_chunking_is_numerically_equivalent(self):
         head = AnatomyMaskedFindingHead(
@@ -198,12 +214,47 @@ class HierarchyModulesTest(unittest.TestCase):
             torch.full((int(valid_mask.sum()), 1), 0.5),
         )
 
+    def test_extreme_log_temperatures_are_bounded_and_finite(self):
+        anatomy = AnatomyGroundingHead(self.hidden_dim)
+        finding = AnatomyMaskedFindingHead(self.hidden_dim, self.finding_count)
+        fusion = GatedEvidenceFusion(self.hidden_dim, self.global_count)
+        anatomy_masks = torch.ones(
+            self.batch_size, self.anatomy_count, self.token_count
+        )
+        finding_evidence = torch.randn(
+            self.batch_size, self.global_count, self.hidden_dim
+        )
+        global_evidence = torch.randn_like(finding_evidence)
+
+        for extreme in (-100.0, 100.0):
+            anatomy.log_attention_temperature.fill_(extreme)
+            finding.log_attention_temperature.data.fill_(extreme)
+            finding.log_logit_temperature.data.fill_(extreme)
+            fusion.log_logit_temperature.data.fill_(extreme)
+            anatomy_output = anatomy(self.anatomy_queries, self.visual_tokens)
+            finding_output = finding(
+                self.finding_queries, self.visual_tokens, anatomy_masks
+            )
+            fusion_output = fusion(
+                finding_evidence,
+                global_evidence,
+                self.global_queries,
+            )
+            for value in (
+                anatomy_output.attention_weights,
+                anatomy_output.roi_mask_logits,
+                finding_output.attention_weights,
+                finding_output.finding_logits,
+                fusion_output.logits,
+            ):
+                self.assertTrue(torch.isfinite(value).all())
+
     def test_global_gradient_reaches_anatomy_head(self):
         visual_tokens = self.visual_tokens.clone().requires_grad_()
         anatomy_queries = self.anatomy_queries.clone().requires_grad_()
         finding_queries = self.finding_queries.clone().requires_grad_()
         global_queries = self.global_queries.clone().requires_grad_()
-        anatomy_head = AnatomyGroundingHead(self.hidden_dim, projection_dim=4)
+        anatomy_head = AnatomyGroundingHead(self.hidden_dim)
         finding_head = AnatomyMaskedFindingHead(
             self.hidden_dim,
             self.finding_count,
@@ -239,8 +290,8 @@ class HierarchyModulesTest(unittest.TestCase):
             anatomy_queries.grad,
             finding_queries.grad,
             global_queries.grad,
-            anatomy_head.query_projection.weight.grad,
-            anatomy_head.token_projection.weight.grad,
+            anatomy_head.log_roi_scale.grad,
+            anatomy_head.roi_bias.grad,
         ):
             self.assertIsNotNone(gradient)
             self.assertTrue(torch.isfinite(gradient).all())

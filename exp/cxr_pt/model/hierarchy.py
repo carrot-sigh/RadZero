@@ -34,6 +34,10 @@ def _validate_temperature(value, name):
         raise ValueError(f"{name} must be positive.")
 
 
+def _bounded_temperature(log_temperature, minimum=1e-3, maximum=1.0):
+    return log_temperature.clamp(math.log(minimum), math.log(maximum)).exp()
+
+
 @dataclass
 class AnatomyGroundingOutput:
     roi_mask_logits: torch.Tensor
@@ -50,18 +54,25 @@ class AnatomyGroundingHead(nn.Module):
     def __init__(
         self,
         hidden_dim,
-        projection_dim=None,
+        num_anatomies=None,
         attention_temperature=0.07,
         empty_mask_policy="all",
     ):
         super().__init__()
         _validate_temperature(attention_temperature, "attention_temperature")
-        projection_dim = projection_dim or hidden_dim
         self.hidden_dim = hidden_dim
-        self.projection_dim = projection_dim
-        self.query_projection = nn.Linear(hidden_dim, projection_dim, bias=False)
-        self.token_projection = nn.Linear(hidden_dim, projection_dim, bias=False)
-        self.log_similarity_scale = nn.Parameter(torch.zeros(1))
+        parameter_count = num_anatomies or 1
+        self.log_roi_scale = nn.Parameter(torch.zeros(parameter_count))
+        self.roi_bias = nn.Parameter(torch.zeros(parameter_count))
+        self.roi_refiner = None
+        if num_anatomies is not None:
+            self.roi_refiner = nn.Sequential(
+                nn.Conv2d(num_anatomies, num_anatomies, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(num_anatomies, num_anatomies, kernel_size=1),
+            )
+            nn.init.zeros_(self.roi_refiner[-1].weight)
+            nn.init.zeros_(self.roi_refiner[-1].bias)
         self.register_buffer(
             "log_attention_temperature",
             torch.tensor(math.log(attention_temperature)),
@@ -100,20 +111,14 @@ class AnatomyGroundingHead(nn.Module):
             visual_tokens,
             spatial_mask=valid_tokens,
             query_mask=valid_queries,
-            temperature=self.log_attention_temperature.exp(),
+            temperature=_bounded_temperature(self.log_attention_temperature),
         )
-
-        projected_queries = self.query_projection(queries)
-        projected_tokens = self.token_projection(visual_tokens)
-        learned_scores = torch.bmm(
-            projected_queries, projected_tokens.transpose(1, 2)
-        ) / math.sqrt(self.projection_dim)
-        cosine_scores = torch.bmm(
-            F.normalize(queries, p=2, dim=-1),
-            F.normalize(visual_tokens, p=2, dim=-1).transpose(1, 2),
-        )
-        roi_mask_logits = (
-            learned_scores + self.log_similarity_scale.exp() * cosine_scores
+        if self.log_roi_scale.numel() not in {1, anatomy_count}:
+            raise ValueError("ROI parameters must be scalar or match anatomy count.")
+        roi_scale = self.log_roi_scale.clamp(-10.0, 10.0).exp().view(1, -1, 1)
+        roi_bias = self.roi_bias.view(1, -1, 1)
+        roi_mask_logits = self._roi_logits_from_similarity(
+            vlcabs_output.similarity_scores, roi_scale, roi_bias
         )
         roi_mask_logits = roi_mask_logits.masked_fill(
             ~valid_tokens.unsqueeze(1), torch.finfo(roi_mask_logits.dtype).min
@@ -132,6 +137,19 @@ class AnatomyGroundingHead(nn.Module):
             evidence_tokens=vlcabs_output.evidence_tokens,
             matching_logits=vlcabs_output.matching_logits,
         )
+
+    def _roi_logits_from_similarity(self, similarity_scores, roi_scale, roi_bias):
+        logits = roi_scale * similarity_scores + roi_bias
+        if self.roi_refiner is None:
+            return logits
+        side = math.isqrt(similarity_scores.size(-1))
+        if side * side != similarity_scores.size(-1):
+            return logits
+        spatial_scores = similarity_scores.reshape(
+            similarity_scores.size(0), similarity_scores.size(1), side, side
+        )
+        refinement = self.roi_refiner(spatial_scores).flatten(2)
+        return logits + refinement
 
 
 @dataclass
@@ -247,10 +265,9 @@ class AnatomyMaskedFindingHead(nn.Module):
         matching_scores = torch.cat(
             [output.matching_logits for output in chunk_outputs], dim=2
         )
-        finding_logits = (
-            matching_scores / self.log_logit_temperature.exp()
-            + self.finding_bias.view(1, 1, -1)
-        )
+        finding_logits = matching_scores / _bounded_temperature(
+            self.log_logit_temperature
+        ) + self.finding_bias.view(1, 1, -1)
         finding_logits = finding_logits * valid_pairs
 
         return FindingRecognitionOutput(
@@ -282,7 +299,7 @@ class AnatomyMaskedFindingHead(nn.Module):
             visual_tokens,
             spatial_mask=pair_masks,
             query_mask=flat_pair_mask,
-            temperature=self.log_attention_temperature.exp(),
+            temperature=_bounded_temperature(self.log_attention_temperature),
         )
 
         return VLCABSOutput(
@@ -424,8 +441,9 @@ class GlobalEvidenceBranch(nn.Module):
         super().__init__()
         _validate_temperature(attention_temperature, "attention_temperature")
         self.hidden_dim = hidden_dim
-        self.log_attention_temperature = nn.Parameter(
-            torch.tensor(math.log(attention_temperature))
+        self.register_buffer(
+            "log_attention_temperature",
+            torch.tensor(math.log(attention_temperature)),
         )
         self.vlcabs = VLCABS(sim_op="cos", empty_mask_policy=empty_mask_policy)
 
@@ -435,15 +453,18 @@ class GlobalEvidenceBranch(nn.Module):
         visual_tokens,
         visual_token_mask=None,
         global_query_mask=None,
+        temperature=None,
     ):
         if visual_tokens.dim() != 3 or visual_tokens.size(-1) != self.hidden_dim:
             raise ValueError("visual_tokens must have shape [B, L, hidden_dim].")
+        if temperature is None:
+            temperature = _bounded_temperature(self.log_attention_temperature)
         return self.vlcabs(
             global_queries,
             visual_tokens,
             spatial_mask=visual_token_mask,
             query_mask=global_query_mask,
-            temperature=self.log_attention_temperature.exp(),
+            temperature=temperature,
         )
 
 
@@ -509,7 +530,9 @@ class GatedEvidenceFusion(nn.Module):
         )
         fused_evidence = gates * projected_finding + (1.0 - gates) * projected_global
         logits = F.cosine_similarity(fused_evidence, queries, dim=-1)
-        logits = logits / self.log_logit_temperature.exp() + self.label_bias.view(1, -1)
+        logits = logits / _bounded_temperature(
+            self.log_logit_temperature
+        ) + self.label_bias.view(1, -1)
 
         valid_queries = _expand_bool_mask(
             global_query_mask,

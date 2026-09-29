@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from test_hierarchical_model import HierarchyHarness, make_config
+from tests.test_hierarchical_model import HierarchyHarness, make_config
 
 
 class HierarchyTrainingControllerTest(unittest.TestCase):
@@ -35,7 +35,9 @@ class HierarchyTrainingControllerTest(unittest.TestCase):
                 self.assertEqual(configured, trainable_names)
                 for name in hierarchy_modules:
                     parameters = list(getattr(self.model, name).parameters())
-                    self.assertTrue(parameters)
+                    if not parameters:
+                        self.assertEqual(name, "global_branch")
+                        continue
                     self.assertEqual(
                         any(parameter.requires_grad for parameter in parameters),
                         name in trainable_names,
@@ -46,6 +48,12 @@ class HierarchyTrainingControllerTest(unittest.TestCase):
                         for parameter in self.model.loss_fns.parameters()
                     )
                 )
+
+    def test_frozen_encoders_stay_in_eval_mode_during_training(self):
+        self.model.configure_hierarchy_training("anatomy")
+
+        for name in self.model.training_controller.ENCODER_MODULES:
+            self.assertFalse(getattr(self.model, name).training)
 
     def test_stage_and_step_survive_state_dict_round_trip(self):
         self.model.configure_hierarchy_training("global")

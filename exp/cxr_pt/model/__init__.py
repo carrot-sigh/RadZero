@@ -39,6 +39,11 @@ def load_model(config, **kwargs):
     logger.info("Build model...")
 
     pretrained_state_dict = config.get("pretrained_state_dict")
+    is_hierarchy = config["model_class_name"] == "HierarchicalCxrAlignModel"
+    if is_hierarchy and not pretrained_state_dict:
+        raise ValueError(
+            "Hierarchy training requires an explicit pretrained_state_dict."
+        )
     if config["pretrained_ckpt"] and pretrained_state_dict:
         raise ValueError(
             "pretrained_ckpt and pretrained_state_dict are mutually exclusive."
@@ -61,8 +66,13 @@ def load_model(config, **kwargs):
         model.to(dtype)
 
     if pretrained_state_dict:
-        logger.info(f"Load RadZero state dict : {pretrained_state_dict}")
-        load_radzero_state_dict(model, pretrained_state_dict)
+        logger.info(f"Load RadZero state dict: {pretrained_state_dict}")
+        incompatible = load_radzero_state_dict(model, pretrained_state_dict)
+        logger.info(
+            "Verified RadZero tensor %s; hierarchy-only missing keys: %d",
+            incompatible.verification_key,
+            len(incompatible.missing_keys),
+        )
 
     # load adapter & trained parameters
     if config["adapter_ckpt"]:
@@ -78,7 +88,17 @@ def load_model(config, **kwargs):
         config, output["model"], output_dir=kwargs["output_dir"]
     )
     if hasattr(output["model"], "configure_hierarchy_training"):
-        output["model"].configure_hierarchy_training()
+        modules = output["model"].configure_hierarchy_training()
+        logger.info(
+            "Hierarchy stage %s; trainable modules: %s; encoders frozen: %s",
+            output["model"].training_controller.stage,
+            ", ".join(modules),
+            not any(
+                parameter.requires_grad
+                for name in output["model"].training_controller.ENCODER_MODULES
+                for parameter in getattr(output["model"], name).parameters()
+            ),
+        )
 
     return output
 

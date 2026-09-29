@@ -11,6 +11,7 @@
 - [x] Verify released checkpoint compatibility (only the loss-module prefix differs).
 - [x] Add automatic `KeyPhraseAlignmentLoss` -> `RadZeroLoss` checkpoint migration.
 - [x] Record and lock the working Conda environment.
+- [x] Require and numerically verify the released RadZero checkpoint at startup.
 
 ## P1 - Dataset pipeline
 
@@ -31,6 +32,8 @@
 - [x] Implement the global VL-CABS branch and gated fusion.
 - [x] Wire all hierarchy stages into one model wrapper and experiment config.
 - [x] Preserve the original RadZero forward and zero-shot inference paths.
+- [x] Share the Stage 1 anatomy similarity map between ROI and matching paths.
+- [x] Reuse full-token original RadZero VL-CABS in the global branch.
 
 ## P3 - Training
 
@@ -39,6 +42,7 @@
 - [ ] Train the anatomy head first with the encoders frozen.
 - [ ] Train finding recognition with GT ROI masks.
 - [x] Add predicted-mask teacher-forcing scheduling and checkpoint state.
+- [x] Rebuild optimizer and scheduler when switching hierarchy stages.
 - [ ] Train Stage 3, then run low-learning-rate joint fine-tuning.
 
 ## P4 - Evaluation
@@ -60,3 +64,5 @@
 - [x] Test gradient flow from global loss to the ROI head.
 - [x] Run a deterministic synthetic tiny-overfit experiment.
 - [x] Add a regression test for original RadZero logits and inference shapes.
+- [x] Test that GT anatomy annotation presence cannot change inference outputs.
+- [x] Test bounded temperatures under extreme log-temperature values.

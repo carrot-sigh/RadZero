@@ -2,12 +2,12 @@ model:
   model_class_name: HierarchicalCxrAlignModel
 
   model_config:
+    pretrained_dir: /home/user/gxq/radzero-model
     hierarchy_config:
       contract_path: exp/cxr_pt/configs/hierarchy_contract.json
       num_anatomies: 36
       num_findings: 41
       num_global_labels: 14
-      anatomy_projection_dim: 256
       attention_temperature: 0.07
       finding_logit_temperature: 0.07
       global_logit_temperature: 0.07
@@ -42,7 +42,7 @@ model:
     - evidence_fusion
 
   # Build the hierarchy model first, then load released RadZero base weights.
-  pretrained_state_dict: null
+  pretrained_state_dict: /home/user/gxq/radzero-model
 
 experiment:
   name: hierarchy

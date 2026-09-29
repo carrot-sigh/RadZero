@@ -65,7 +65,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
 
         self.anatomy_head = AnatomyGroundingHead(
             self.hidden_size,
-            projection_dim=hierarchy_config.get("anatomy_projection_dim"),
+            num_anatomies=self.num_anatomies,
             attention_temperature=attention_temperature,
             empty_mask_policy=empty_mask_policy,
         )
@@ -113,6 +113,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         anatomy_targets=None,
         finding_targets=None,
         global_targets=None,
+        anatomy_annotation_mask=None,
         anatomy_valid_mask=None,
         finding_valid_mask=None,
         global_valid_mask=None,
@@ -130,6 +131,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         )
         return self.forward_hierarchy_from_features(
             visual_tokens=vision_outputs["image_patch_tokens"],
+            global_visual_tokens=vision_outputs["vision_tokens"],
             anatomy_queries=anatomy_queries,
             finding_queries=finding_queries,
             global_queries=global_queries,
@@ -146,6 +148,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             anatomy_targets=anatomy_targets,
             finding_targets=finding_targets,
             global_targets=global_targets,
+            anatomy_annotation_mask=anatomy_annotation_mask,
             anatomy_valid_mask=anatomy_valid_mask,
             finding_valid_mask=finding_valid_mask,
             global_valid_mask=global_valid_mask,
@@ -158,6 +161,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         anatomy_queries,
         finding_queries,
         global_queries,
+        global_visual_tokens=None,
         vision_outputs=None,
         anatomy_query_mask=None,
         global_query_mask=None,
@@ -171,6 +175,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         anatomy_targets=None,
         finding_targets=None,
         global_targets=None,
+        anatomy_annotation_mask=None,
         anatomy_valid_mask=None,
         finding_valid_mask=None,
         global_valid_mask=None,
@@ -198,23 +203,37 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             compatibility_mask=compatibility_mask,
             finding_chunk_size=finding_chunk_size,
         )
+        global_queries_for_branch, global_visual_tokens = (
+            self._prepare_radzero_global_inputs(
+                global_queries,
+                (
+                    global_visual_tokens
+                    if global_visual_tokens is not None
+                    else visual_tokens
+                ),
+            )
+        )
         finding_aggregation = self.finding_aggregator(
-            global_queries,
+            global_queries_for_branch,
             finding.evidence_tokens,
             finding_scores=finding.finding_logits,
             pair_mask=finding.pair_mask,
             global_query_mask=global_query_mask,
         )
+        global_token_mask = self._global_visual_token_mask(
+            visual_token_mask, visual_tokens, global_visual_tokens
+        )
         global_evidence = self.global_branch(
-            global_queries,
-            visual_tokens,
-            visual_token_mask=visual_token_mask,
+            global_queries_for_branch,
+            global_visual_tokens,
+            visual_token_mask=global_token_mask,
             global_query_mask=global_query_mask,
+            temperature=self._radzero_attention_temperature(),
         )
         fusion = self.evidence_fusion(
             finding_aggregation.evidence_tokens,
             global_evidence.evidence_tokens,
-            global_queries,
+            global_queries_for_branch,
             global_query_mask=global_query_mask,
         )
         if vision_outputs is None:
@@ -222,6 +241,16 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
 
         losses = None
         if return_loss:
+            if anatomy_annotation_mask is not None and anatomy_valid_mask is not None:
+                if not torch.equal(anatomy_annotation_mask, anatomy_valid_mask):
+                    raise ValueError(
+                        "anatomy_annotation_mask and legacy anatomy_valid_mask disagree."
+                    )
+            anatomy_supervision_mask = (
+                anatomy_annotation_mask
+                if anatomy_annotation_mask is not None
+                else anatomy_valid_mask
+            )
             losses = self.hierarchy_loss(
                 anatomy.roi_mask_logits,
                 finding.finding_logits,
@@ -229,7 +258,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
                 anatomy_targets=anatomy_targets,
                 finding_targets=finding_targets,
                 global_targets=global_targets,
-                anatomy_valid_mask=anatomy_valid_mask,
+                anatomy_valid_mask=anatomy_supervision_mask,
                 finding_valid_mask=finding_valid_mask,
                 global_valid_mask=global_valid_mask,
                 anatomy_query_mask=anatomy_query_mask,
@@ -248,6 +277,35 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             anatomy_masks_used=anatomy_masks_used,
             losses=losses,
         )
+
+    def _prepare_radzero_global_inputs(self, queries, visual_tokens):
+        radzero_loss = self.loss_fns["RadZeroLoss"]
+        if radzero_loss.layer_norm is not None:
+            queries = radzero_loss.layer_norm(queries)
+            visual_tokens = radzero_loss.layer_norm(visual_tokens)
+        return queries, visual_tokens
+
+    def _radzero_attention_temperature(self):
+        radzero_loss = self.loss_fns["RadZeroLoss"]
+        log_temperature = (
+            radzero_loss.attn_temperature
+            if radzero_loss.attn_temperature is not None
+            else radzero_loss.loss_temperature
+        )
+        return log_temperature.clamp(-6.907755, 0.0).exp()
+
+    @staticmethod
+    def _global_visual_token_mask(patch_mask, patch_tokens, global_tokens):
+        if patch_mask is None or global_tokens.size(1) == patch_tokens.size(1):
+            return patch_mask
+        if global_tokens.size(1) != patch_tokens.size(1) + 1:
+            raise ValueError(
+                "Global visual tokens must be patch tokens with optional CLS."
+            )
+        cls_mask = torch.ones(
+            patch_mask.size(0), 1, dtype=torch.bool, device=patch_mask.device
+        )
+        return torch.cat([cls_mask, patch_mask.to(dtype=torch.bool)], dim=1)
 
     def _encode_prompt_bank(self, encoded_prompts, expected_count, name):
         if encoded_prompts is None:
@@ -317,7 +375,20 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         return self._select_anatomy_masks(predicted_masks, override, detach)
 
     def configure_hierarchy_training(self, stage=None):
-        return self.training_controller.configure_model(self, stage=stage)
+        modules = self.training_controller.configure_model(self, stage=stage)
+        self.train(self.training)
+        return modules
+
+    def train(self, mode=True):
+        super().train(mode)
+        if mode:
+            for module_name in self.training_controller.ENCODER_MODULES:
+                module = getattr(self, module_name)
+                if not any(
+                    parameter.requires_grad for parameter in module.parameters()
+                ):
+                    module.eval()
+        return self
 
     def set_hierarchy_training_step(self, step):
         self.training_controller.set_step(step)

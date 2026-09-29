@@ -78,7 +78,6 @@ def make_config(hidden_dim=8, anatomies=3, findings=4, globals_=5):
             "num_anatomies": anatomies,
             "num_findings": findings,
             "num_global_labels": globals_,
-            "anatomy_projection_dim": 4,
             "finding_chunk_size": 2,
             "aggregation_num_heads": 2,
         },
@@ -93,7 +92,7 @@ class HierarchicalModelTest(unittest.TestCase):
         self.anatomies = 3
         self.findings = 4
         self.globals = 5
-        self.tokens = 7
+        self.tokens = 9
         self.hidden_dim = 8
         self.model = HierarchyHarness(
             make_config(self.hidden_dim, self.anatomies, self.findings, self.globals)
@@ -154,6 +153,29 @@ class HierarchicalModelTest(unittest.TestCase):
         )
         self.assertFalse(output.anatomy_masks_used.requires_grad)
 
+    def test_annotation_presence_does_not_change_inference(self):
+        self.model.eval()
+        first = self.model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+            anatomy_annotation_mask=torch.ones(
+                self.batch_size, self.anatomies, dtype=torch.bool
+            ),
+        )
+        second = self.model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+            anatomy_annotation_mask=torch.zeros(
+                self.batch_size, self.anatomies, dtype=torch.bool
+            ),
+        )
+
+        torch.testing.assert_close(first.logits, second.logits)
+
     def test_original_forward_and_compute_logits_are_inherited(self):
         self.assertIs(HierarchicalCxrAlignModel.forward, CxrAlignModel.forward)
         self.assertIs(
@@ -209,7 +231,8 @@ class HierarchicalModelTest(unittest.TestCase):
             },
         )
         for gradient in (
-            self.model.anatomy_head.query_projection.weight.grad,
+            self.model.anatomy_head.log_roi_scale.grad,
+            self.model.anatomy_head.roi_bias.grad,
             self.model.finding_head.finding_bias.grad,
             self.model.evidence_fusion.label_bias.grad,
         ):
@@ -220,6 +243,41 @@ class HierarchicalModelTest(unittest.TestCase):
                 parameter.grad is not None and torch.isfinite(parameter.grad).all()
                 for parameter in self.model.anatomy_head.parameters()
             )
+        )
+
+    def test_global_branch_matches_original_radzero_vlcabs(self):
+        output = self.model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+        )
+        queries = self.model._encode_prompt_bank(
+            self.encoded_global, self.globals, "global"
+        )
+        queries, tokens = self.model._prepare_radzero_global_inputs(
+            queries, self.pixel_values
+        )
+        reference = self.model.loss_fns["RadZeroLoss"].similarity_logit.vlcabs(
+            queries,
+            tokens,
+            temperature=self.model._radzero_attention_temperature(),
+        )
+
+        torch.testing.assert_close(
+            output.global_evidence.similarity_scores, reference.similarity_scores
+        )
+        torch.testing.assert_close(
+            output.global_evidence.attention_weights, reference.attention_weights
+        )
+        torch.testing.assert_close(
+            output.global_evidence.evidence_tokens, reference.evidence_tokens
+        )
+        torch.testing.assert_close(
+            output.global_evidence.matching_logits, reference.matching_logits
+        )
+        self.assertEqual(
+            output.global_evidence.attention_weights.size(-1), self.tokens + 1
         )
 
     def test_hierarchy_loss_requires_at_least_one_target(self):

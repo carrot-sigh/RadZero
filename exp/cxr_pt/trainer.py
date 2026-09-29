@@ -37,6 +37,28 @@ class CXRPreTrainer(BaseTrainer):
             **kwargs,
         )
 
+    def configure_hierarchy_stage(self, stage, num_training_steps):
+        """Switch stages between train runs and rebuild optimization state."""
+        if getattr(self, "is_in_train", False):
+            raise RuntimeError(
+                "Hierarchy stages cannot change inside an active train loop."
+            )
+        if not hasattr(self.model, "configure_hierarchy_training"):
+            raise ValueError("Trainer model does not support hierarchy stages.")
+        modules = self.model.configure_hierarchy_training(stage)
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.create_optimizer_and_scheduler(num_training_steps=num_training_steps)
+        if hasattr(self, "callback_handler"):
+            self.callback_handler.optimizer = self.optimizer
+            self.callback_handler.lr_scheduler = self.lr_scheduler
+        logger.info(
+            "Hierarchy stage switched to %s; rebuilt optimizer/scheduler for: %s",
+            stage,
+            ", ".join(modules),
+        )
+        return modules
+
     def compute_loss(self, model, inputs, return_outputs=False):
         if "encoded_anatomy_prompts" in inputs:
             if hasattr(model, "set_hierarchy_training_step"):

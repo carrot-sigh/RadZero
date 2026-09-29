@@ -251,8 +251,8 @@ class HierarchyJsonlDataset(Dataset):
         return {
             "image": image,
             "anatomy_targets": anatomy_targets.flatten(1),
-            "anatomy_valid_mask": anatomy_valid,
-            "anatomy_query_mask": anatomy_valid,
+            "anatomy_annotation_mask": anatomy_valid,
+            "anatomy_query_mask": torch.ones(num_anatomies, dtype=torch.bool),
             "finding_targets": finding_targets,
             "finding_valid_mask": finding_valid,
             "global_targets": global_targets,
@@ -336,7 +336,7 @@ def hierarchy_collate_fn(batch, tokenizer, image_processor, contract_path):
         output = {"pixel_values": torch.as_tensor(np.asarray(pixel_values))}
     for key in (
         "anatomy_targets",
-        "anatomy_valid_mask",
+        "anatomy_annotation_mask",
         "anatomy_query_mask",
         "finding_targets",
         "finding_valid_mask",

@@ -9,7 +9,7 @@ validity masks before calling the model.
 | Tensor | Shape | Meaning |
 | --- | --- | --- |
 | `anatomy_targets` | `[B, A, L]` | Binary patch-level anatomy masks |
-| `anatomy_valid_mask` | `[B, A]` or `[B, A, L]` | Supervised regions or patches |
+| `anatomy_annotation_mask` | `[B, A]` or `[B, A, L]` | Regions or patches with GT supervision |
 | `finding_targets` | `[B, A, F]` | Binary region-finding labels |
 | `finding_valid_mask` | `[B, A, F]` | Annotated region-finding pairs |
 | `global_targets` | `[B, J]` | Binary global labels |
@@ -38,7 +38,9 @@ only when another global label is explicitly positive for the study.
 
 Model structure masks are applied in addition to annotation validity:
 
-- `anatomy_query_mask` excludes unavailable anatomy queries.
+- `anatomy_query_mask` identifies vocabulary queries available to the model. It
+  is all true for the fixed 36-anatomy vocabulary and must not be derived from
+  GT bbox availability.
 - `visual_token_mask` excludes padded or invalid image patches.
 - the anatomy-finding compatibility mask excludes invalid pairs.
 - `global_query_mask` excludes unavailable global-label queries.
@@ -47,5 +49,5 @@ An all-invalid task or batch returns a finite, differentiable zero loss. Targets
 may be omitted by stage; `return_loss=True` requires at least one target tensor.
 
 `gt_anatomy_masks` is a model input for teacher forcing, not a loss target. It
-must always contain finite values in `[0, 1]`; unavailable anatomy regions use a
-zero mask and are excluded with `anatomy_query_mask`.
+must always contain finite values in `[0, 1]`. Missing annotations are excluded
+from loss and metrics with `anatomy_annotation_mask`, never from model forward.
