@@ -21,6 +21,7 @@ from .hierarchy import (
     GatedEvidenceFusion,
     GatedFusionOutput,
     GlobalEvidenceBranch,
+    masks_to_feature_boxes,
 )
 from .hierarchy_losses import HierarchyLoss, HierarchyLossOutput
 from .hierarchy_training import HierarchyTrainingController

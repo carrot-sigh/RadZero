@@ -11,6 +11,7 @@ from exp.cxr_pt.model.hierarchy import (
     FindingLocalRefiner,
     GatedEvidenceFusion,
     GlobalEvidenceBranch,
+    masks_to_feature_boxes,
 )
 
 
@@ -124,6 +125,16 @@ class HierarchyModulesTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output.finding_logits).all())
         self.assertTrue(
             torch.equal(output.finding_logits, torch.zeros_like(output.finding_logits))
+        )
+
+    def test_predicted_masks_convert_to_feature_boxes(self):
+        masks = torch.zeros(1, 2, 4, 4)
+        masks[0, 0, 1:3, 2:4] = 1
+
+        boxes = masks_to_feature_boxes(masks)
+
+        torch.testing.assert_close(
+            boxes, torch.tensor([[[2.0, 1.0, 4.0, 3.0], [0.0, 0.0, 0.0, 0.0]]])
         )
 
     def test_anatomy_roi_refiner_consumes_shared_similarity_map(self):

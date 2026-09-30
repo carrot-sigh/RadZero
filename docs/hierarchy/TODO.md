@@ -75,3 +75,4 @@
 - [x] Run Stage 3 evidence, Finding-logit, and forced-gate interventions on the
   tiny-overfit set.
 - [x] Run the controlled Stage 2 Feature ROI held-out pilot and capacity control.
+- [x] Run predicted-ROI Stage 2 pilots using a held-out-trained Anatomy Head.

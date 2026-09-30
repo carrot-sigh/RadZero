@@ -101,9 +101,34 @@ lower lung, left lower lung, and cardiac silhouette. They are under:
 The inspected overlays showed correct left/right placement, bbox scale, and no
 invalid local attention values.
 
+## Predicted ROI pilot
+
+Because deployment has no GT boxes, a separate Stage 1 Anatomy Head pilot was
+trained on the same 256-image train subset for 200 updates. Its independent
+128-image validation result was Dice `0.670370` and IoU `0.534598`; the saved
+checkpoint is outside Git at
+`/home/user/gxq/stage1-validation/pilot-256x128/anatomy_head.pt`.
+
+The Stage 2 pilot then used only predicted Anatomy masks. For Feature ROI, the
+predicted 37x37 masks were converted to continuous feature-grid boxes; GT
+annotation validity was not used.
+
+| Strategy | Valid loss | Macro AUROC | Macro AUPRC | Macro F1 |
+| --- | ---: | ---: | ---: | ---: |
+| GT Masked ROI | 0.551174 | 0.761089 | 0.795189 | 0.758083 |
+| Predicted Masked ROI | 0.531897 | 0.771100 | 0.797030 | 0.759861 |
+| GT Feature ROI | 0.895156 | 0.779609 | 0.781876 | 0.593896 |
+| Predicted Feature ROI | 0.907259 | 0.759594 | 0.782312 | 0.569570 |
+
+On this pilot, Masked ROI is robust to the Stage 1 prediction path. Feature ROI
+loses about `0.020` AUROC and `0.024` F1 when moving from GT to predicted
+geometry, while its validation loss increases. This makes predicted geometry a
+current blocker for using Feature ROI as the primary deployment route.
+
 ## Decision
 
-1. Feature ROI is not a clear overall replacement: it has the best AUROC, but
+1. Feature ROI is not a clear overall replacement: with GT geometry it has the
+   best AUROC, but
    worse validation loss, AUPRC, and F1 than the 43-parameter baselines.
 2. The capacity control is essential. Full Image + the same refiner has nearly
    the same AUROC and higher AUPRC than Feature ROI, so the pilot does not
@@ -114,3 +139,6 @@ invalid local attention values.
    default Stage 2 path from this pilot. Keep it as an ablation and investigate
    class-balanced training, context margin, and validation calibration only in
    a subsequent controlled study.
+5. The more deployment-relevant predicted-ROI result strengthens that decision:
+   current Masked ROI is the safer main route until Anatomy localization or
+   bbox extraction is improved.

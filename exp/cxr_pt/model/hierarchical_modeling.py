@@ -15,6 +15,7 @@ from .hierarchy import (
     GatedEvidenceFusion,
     GatedFusionOutput,
     GlobalEvidenceBranch,
+    masks_to_feature_boxes,
 )
 from .hierarchy_losses import HierarchyLoss
 from .hierarchy_training import HierarchyTrainingController
@@ -449,7 +450,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         strategy = self.finding_roi_strategy
         if strategy == "feature_roi":
             if anatomy_boxes is None:
-                raise ValueError("feature_roi requires GT or predicted anatomy_boxes.")
+                anatomy_boxes = masks_to_feature_boxes(anatomy_masks)
             local_tokens, valid_boxes, _ = self.feature_roi_extractor(
                 visual_tokens,
                 anatomy_boxes,

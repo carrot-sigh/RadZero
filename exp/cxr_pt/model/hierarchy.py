@@ -39,6 +39,29 @@ def _bounded_temperature(log_temperature, minimum=1e-3, maximum=1.0):
     return log_temperature.clamp(math.log(minimum), math.log(maximum)).exp()
 
 
+def masks_to_feature_boxes(masks, threshold=0.5):
+    """Convert [B, A, H, W] masks into clipped continuous grid boxes."""
+    if masks.dim() == 3:
+        side = math.isqrt(masks.size(2))
+        if side * side != masks.size(2):
+            raise ValueError("Flattened masks must contain a square feature grid.")
+        masks = masks.reshape(masks.size(0), masks.size(1), side, side)
+    if masks.dim() != 4 or masks.size(-2) != masks.size(-1):
+        raise ValueError("masks must have shape [B, A, H, W] or [B, A, H*W].")
+    batch_size, anatomy_count, height, width = masks.shape
+    boxes = masks.new_zeros(batch_size, anatomy_count, 4)
+    valid = masks >= threshold
+    for batch_index in range(batch_size):
+        for anatomy_index in range(anatomy_count):
+            ys, xs = torch.where(valid[batch_index, anatomy_index])
+            if xs.numel() == 0:
+                continue
+            boxes[batch_index, anatomy_index] = boxes.new_tensor(
+                [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]
+            )
+    return boxes
+
+
 @dataclass
 class AnatomyGroundingOutput:
     roi_mask_logits: torch.Tensor

@@ -15,7 +15,8 @@ from PIL import ImageDraw
 from common.utils import Config
 from exp.cxr_pt.hierarchy_dataset import HierarchyJsonlDataset, hierarchy_collate_fn
 from exp.cxr_pt.hierarchy_metrics import multilabel_metrics
-from exp.cxr_pt.model import load_model
+from exp.cxr_pt.hierarchy_metrics import anatomy_iou_dice
+from exp.cxr_pt.model import load_model, masks_to_feature_boxes
 
 
 def _load_config(config_path, config_overrides):
@@ -51,6 +52,21 @@ def _select_balanced_indices(dataset, count, seed, candidate_pool=512):
         raise ValueError(
             f"Only {len(candidates)} samples contain both positive and negative "
             f"finding labels; requested {count}."
+        )
+    random.Random(seed).shuffle(candidates)
+    return candidates[:count]
+
+
+def _select_anatomy_indices(dataset, count, seed, candidate_pool=1024):
+    candidates = []
+    for index in range(min(len(dataset), candidate_pool)):
+        item = dataset[index]
+        if int(item["anatomy_annotation_mask"].sum().item()) >= 20:
+            candidates.append(index)
+    if len(candidates) < count:
+        raise ValueError(
+            f"Only {len(candidates)} samples have at least 20 anatomy boxes; "
+            f"requested {count}."
         )
     random.Random(seed).shuffle(candidates)
     return candidates[:count]
@@ -282,7 +298,8 @@ def _select_roi_boxes(batch, args):
         )
         return boxes[permutation], permutation.cpu().tolist()
     raise ValueError(
-        "Feature ROI supports --roi-mode gt or shuffled; " f"got {args.roi_mode!r}."
+        "Feature ROI supports --roi-mode gt, shuffled, or predicted; "
+        f"got {args.roi_mode!r}."
     )
 
 
@@ -297,9 +314,27 @@ def _prepare_stage2_features(model, batch, args, device):
         finding_queries = model._encode_prompt_bank(
             batch["encoded_finding_prompts"], model.num_findings, "finding"
         )
+        anatomy_annotation_mask = batch["anatomy_annotation_mask"]
         if args.finding_roi_strategy == "feature_roi":
-            anatomy_masks = batch["gt_anatomy_masks"]
-            anatomy_boxes, roi_permutation = _select_roi_boxes(batch, args)
+            if args.roi_mode == "predicted":
+                anatomy_queries = model._encode_prompt_bank(
+                    batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy"
+                )
+                _load_anatomy_head_checkpoint(model, args.anatomy_checkpoint)
+                prediction = model.anatomy_head(
+                    anatomy_queries,
+                    vision["image_patch_tokens"],
+                    anatomy_query_mask=batch["anatomy_query_mask"],
+                )
+                anatomy_masks = prediction.roi_masks
+                anatomy_boxes = masks_to_feature_boxes(anatomy_masks)
+                anatomy_annotation_mask = (
+                    anatomy_boxes[..., 2] > anatomy_boxes[..., 0]
+                ) & (anatomy_boxes[..., 3] > anatomy_boxes[..., 1])
+                roi_permutation = None
+            else:
+                anatomy_masks = batch["gt_anatomy_masks"]
+                anatomy_boxes, roi_permutation = _select_roi_boxes(batch, args)
         elif args.finding_roi_strategy in {"full", "full_refiner"}:
             anatomy_masks = torch.ones_like(batch["gt_anatomy_masks"])
             anatomy_boxes = batch["anatomy_boxes"]
@@ -324,7 +359,7 @@ def _prepare_stage2_features(model, batch, args, device):
         "finding_queries": finding_queries.detach(),
         "anatomy_masks": anatomy_masks.detach(),
         "anatomy_boxes": anatomy_boxes.detach(),
-        "anatomy_annotation_mask": batch["anatomy_annotation_mask"],
+        "anatomy_annotation_mask": anatomy_annotation_mask,
         "anatomy_query_mask": batch["anatomy_query_mask"],
         "compatibility_mask": batch["compatibility_mask"],
         "finding_targets": batch["finding_targets"],
@@ -360,6 +395,214 @@ def _cache_stage2_features(model, dataset, indices, batch_size, models, args, de
             }
         )
     return cached
+
+
+def _cache_anatomy_features(model, dataset, indices, batch_size, models, device):
+    cached = []
+    for start in range(0, len(indices), batch_size):
+        samples = [dataset[index] for index in indices[start : start + batch_size]]
+        batch = hierarchy_collate_fn(
+            samples,
+            tokenizer=models["tokenizer"],
+            image_processor=models["image_processor"],
+            contract_path=dataset.contract_path,
+        )
+        batch = _to_device(batch, device)
+        with torch.no_grad(), torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ):
+            vision = model.forward_vision_model(batch["pixel_values"])
+            anatomy_queries = model._encode_prompt_bank(
+                batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy"
+            )
+        cached.append(
+            {
+                "visual_tokens": vision["image_patch_tokens"].detach().cpu(),
+                "anatomy_queries": anatomy_queries.detach().cpu(),
+                "anatomy_targets": batch["anatomy_targets"].detach().cpu(),
+                "anatomy_valid_mask": batch["anatomy_annotation_mask"].detach().cpu(),
+                "anatomy_query_mask": batch["anatomy_query_mask"].detach().cpu(),
+            }
+        )
+    return cached
+
+
+def run_stage1_pilot(args):
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.empty_cache()
+    device = torch.device(args.device)
+    config = _load_config(args.config, args.config_overrides)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    models = load_model(config["model"], output_dir=str(output_dir))
+    model = models["model"].to(device)
+    model.configure_hierarchy_training("anatomy")
+    hierarchy_config = config["dataset"]["hierarchy"]
+    train_dataset = HierarchyJsonlDataset(
+        hierarchy_config["manifest_path"],
+        hierarchy_config["image_root"],
+        hierarchy_config["contract_path"],
+        split=hierarchy_config.get("train_split", "train"),
+        patch_grid_size=hierarchy_config["patch_grid_size"],
+    )
+    valid_dataset = HierarchyJsonlDataset(
+        hierarchy_config["manifest_path"],
+        hierarchy_config["image_root"],
+        hierarchy_config["contract_path"],
+        split=hierarchy_config.get("eval_split", "valid"),
+        patch_grid_size=hierarchy_config["patch_grid_size"],
+    )
+    train_indices = _select_anatomy_indices(train_dataset, args.train_images, args.seed)
+    valid_indices = _select_anatomy_indices(
+        valid_dataset, args.valid_images, args.seed + 1
+    )
+    train_cached = _cache_anatomy_features(
+        model, train_dataset, train_indices, args.batch_size, models, device
+    )
+    valid_cached = _cache_anatomy_features(
+        model, valid_dataset, valid_indices, args.batch_size, models, device
+    )
+    trainable_names = [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
+    if not trainable_names or not all(
+        name.startswith("anatomy_head.") for name in trainable_names
+    ):
+        raise RuntimeError(
+            f"Unexpected Stage 1 trainable parameters: {trainable_names}"
+        )
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+
+    def evaluate(cached):
+        losses = []
+        predictions = []
+        targets = []
+        valid_masks = []
+        model.eval()
+        with torch.no_grad():
+            for item in cached:
+                visual_tokens = item["visual_tokens"].to(device)
+                anatomy_queries = item["anatomy_queries"].to(device)
+                anatomy_targets = item["anatomy_targets"].to(device)
+                anatomy_valid = item["anatomy_valid_mask"].to(device)
+                query_mask = item["anatomy_query_mask"].to(device)
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=device.type == "cuda",
+                ):
+                    output = model.anatomy_head(
+                        anatomy_queries,
+                        visual_tokens,
+                        anatomy_query_mask=query_mask,
+                    )
+                    loss = model.hierarchy_loss(
+                        output.roi_mask_logits,
+                        None,
+                        None,
+                        anatomy_targets=anatomy_targets,
+                        anatomy_valid_mask=anatomy_valid,
+                        anatomy_query_mask=query_mask,
+                    ).anatomy_loss
+                losses.append(float(loss.float().item()))
+                predictions.append(output.roi_masks.detach().cpu())
+                targets.append(anatomy_targets.detach().cpu())
+                valid_masks.append(anatomy_valid.detach().cpu())
+        predictions = torch.cat(predictions).reshape(
+            -1, model.num_anatomies, *train_dataset.patch_grid_size
+        )
+        targets = torch.cat(targets).reshape_as(predictions)
+        valid_masks = torch.cat(valid_masks)
+        metrics = anatomy_iou_dice(predictions, targets, valid_masks)
+        return {
+            "loss": float(sum(losses) / len(losses)),
+            "dice": float(metrics["dice"].item()),
+            "iou": float(metrics["iou"].item()),
+        }
+
+    initial = evaluate(valid_cached)
+    history = []
+    model.train()
+    for step in range(args.steps):
+        item = train_cached[step % len(train_cached)]
+        visual_tokens = item["visual_tokens"].to(device)
+        anatomy_queries = item["anatomy_queries"].to(device)
+        anatomy_targets = item["anatomy_targets"].to(device)
+        anatomy_valid = item["anatomy_valid_mask"].to(device)
+        query_mask = item["anatomy_query_mask"].to(device)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ):
+            output = model.anatomy_head(
+                anatomy_queries,
+                visual_tokens,
+                anatomy_query_mask=query_mask,
+            )
+            loss = model.hierarchy_loss(
+                output.roi_mask_logits,
+                None,
+                None,
+                anatomy_targets=anatomy_targets,
+                anatomy_valid_mask=anatomy_valid,
+                anatomy_query_mask=query_mask,
+            ).anatomy_loss
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite Stage 1 loss at step {step + 1}.")
+        loss.backward()
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            args.max_grad_norm,
+        )
+        if not torch.isfinite(gradient_norm):
+            raise RuntimeError("Non-finite Stage 1 gradient.")
+        optimizer.step()
+        if step == 0 or (step + 1) % args.log_every == 0 or step + 1 == args.steps:
+            history.append(
+                {
+                    "step": step + 1,
+                    "loss": float(loss.detach().float().item()),
+                    "gradient_norm": float(gradient_norm.detach().float().item()),
+                }
+            )
+    final = evaluate(valid_cached)
+    report = {
+        "experiment": "stage1_real_pilot",
+        "seed": args.seed,
+        "train_images": args.train_images,
+        "valid_images": args.valid_images,
+        "steps": args.steps,
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "train_indices": train_indices,
+        "valid_indices": valid_indices,
+        "trainable_parameters": trainable_names,
+        "trainable_parameter_count": sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ),
+        "initial_validation": initial,
+        "final_validation": final,
+        "history": history,
+        "loss_decreased": final["loss"] < initial["loss"],
+    }
+    report_path = output_dir / "stage1_pilot.json"
+    checkpoint_path = output_dir / "anatomy_head.pt"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    torch.save(model.anatomy_head.state_dict(), checkpoint_path)
+    print(json.dumps({"report": str(report_path), **final}, indent=2))
+    return report
 
 
 def run_stage2_tiny_overfit(args):
@@ -409,9 +652,27 @@ def run_stage2_tiny_overfit(args):
             anatomy_queries = model._encode_prompt_bank(
                 batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy"
             )
+        anatomy_annotation_mask = batch["anatomy_annotation_mask"]
         if args.finding_roi_strategy == "feature_roi":
-            anatomy_masks = batch["gt_anatomy_masks"]
-            anatomy_boxes, roi_permutation = _select_roi_boxes(batch, args)
+            if args.roi_mode == "predicted":
+                anatomy_queries = model._encode_prompt_bank(
+                    batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy"
+                )
+                _load_anatomy_head_checkpoint(model, args.anatomy_checkpoint)
+                prediction = model.anatomy_head(
+                    anatomy_queries,
+                    vision["image_patch_tokens"],
+                    anatomy_query_mask=batch["anatomy_query_mask"],
+                )
+                anatomy_masks = prediction.roi_masks
+                anatomy_boxes = masks_to_feature_boxes(anatomy_masks)
+                anatomy_annotation_mask = (
+                    anatomy_boxes[..., 2] > anatomy_boxes[..., 0]
+                ) & (anatomy_boxes[..., 3] > anatomy_boxes[..., 1])
+                roi_permutation = None
+            else:
+                anatomy_masks = batch["gt_anatomy_masks"]
+                anatomy_boxes, roi_permutation = _select_roi_boxes(batch, args)
         else:
             anatomy_masks, roi_permutation = _select_roi_masks(
                 model,
@@ -427,7 +688,7 @@ def run_stage2_tiny_overfit(args):
         "finding_queries": finding_queries.detach(),
         "anatomy_masks": anatomy_masks.detach(),
         "anatomy_boxes": anatomy_boxes.detach(),
-        "anatomy_annotation_mask": batch["anatomy_annotation_mask"],
+        "anatomy_annotation_mask": anatomy_annotation_mask,
         "anatomy_query_mask": batch["anatomy_query_mask"],
         "compatibility_mask": batch["compatibility_mask"],
         "finding_targets": batch["finding_targets"],
@@ -730,7 +991,7 @@ def run_stage2_pilot(args):
         strategy_args = SimpleNamespace(
             finding_roi_strategy=strategy,
             roi_mode=args.roi_mode,
-            anatomy_checkpoint=None,
+            anatomy_checkpoint=args.anatomy_checkpoint,
         )
         train_cached = _cache_stage2_features(
             model,
@@ -1306,6 +1567,26 @@ def main():
     stage2.add_argument("--max-grad-norm", type=float, default=10.0)
     stage2.add_argument("--log-every", type=int, default=10)
     stage2.add_argument("--seed", type=int, default=20260930)
+    stage1 = subparsers.add_parser("stage1-pilot")
+    stage1.add_argument("--config", default="exp/cxr_pt/config.yaml")
+    stage1.add_argument(
+        "--config-overrides",
+        nargs="+",
+        default=["radzero.yaml", "hierarchy.yaml", "paths.yaml"],
+    )
+    stage1.add_argument(
+        "--output-dir", default="/home/user/gxq/stage1-validation/pilot"
+    )
+    stage1.add_argument("--device", default="cuda:0")
+    stage1.add_argument("--train-images", type=int, default=256)
+    stage1.add_argument("--valid-images", type=int, default=128)
+    stage1.add_argument("--batch-size", type=int, default=16)
+    stage1.add_argument("--steps", type=int, default=200)
+    stage1.add_argument("--learning-rate", type=float, default=1e-2)
+    stage1.add_argument("--weight-decay", type=float, default=0.0)
+    stage1.add_argument("--max-grad-norm", type=float, default=10.0)
+    stage1.add_argument("--log-every", type=int, default=20)
+    stage1.add_argument("--seed", type=int, default=20260930)
     pilot = subparsers.add_parser("stage2-pilot")
     pilot.add_argument("--config", default="exp/cxr_pt/config.yaml")
     pilot.add_argument(
@@ -1331,7 +1612,10 @@ def main():
     pilot.add_argument("--log-every", type=int, default=20)
     pilot.add_argument("--seed", type=int, default=20260930)
     pilot.add_argument("--context-margin", type=float, default=0.0)
-    pilot.add_argument("--roi-mode", choices=("gt", "shuffled"), default="gt")
+    pilot.add_argument(
+        "--roi-mode", choices=("gt", "shuffled", "predicted"), default="gt"
+    )
+    pilot.add_argument("--anatomy-checkpoint")
     stage3 = subparsers.add_parser("stage3-tiny-overfit")
     stage3.add_argument("--config", default="exp/cxr_pt/config.yaml")
     stage3.add_argument(
@@ -1354,6 +1638,8 @@ def main():
     args = parser.parse_args()
     if args.experiment == "stage2-tiny-overfit":
         run_stage2_tiny_overfit(args)
+    elif args.experiment == "stage1-pilot":
+        run_stage1_pilot(args)
     elif args.experiment == "stage2-pilot":
         run_stage2_pilot(args)
     elif args.experiment == "stage3-tiny-overfit":

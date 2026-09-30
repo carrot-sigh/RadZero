@@ -178,6 +178,30 @@ class HierarchicalModelTest(unittest.TestCase):
         )
         self.assertEqual(output.fusion.logits.shape, (self.batch_size, self.globals))
 
+    def test_feature_roi_inference_derives_boxes_from_predicted_masks(self):
+        model = HierarchyHarness(
+            make_config(
+                self.hidden_dim,
+                self.anatomies,
+                self.findings,
+                self.globals,
+                finding_roi_strategy="feature_roi",
+            )
+        )
+
+        output = model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+        )
+
+        self.assertEqual(
+            output.finding.attention_weights.shape,
+            (self.batch_size, self.anatomies, self.findings, 4),
+        )
+        self.assertTrue(torch.isfinite(output.finding.finding_logits).all())
+
     def test_feature_roi_stage_trains_refiner_but_keeps_encoders_frozen(self):
         model = HierarchyHarness(make_config(finding_roi_strategy="feature_roi"))
         configured = set(model.configure_hierarchy_training("finding"))
