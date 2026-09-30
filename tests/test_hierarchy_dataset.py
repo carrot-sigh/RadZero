@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from exp.cxr_pt.hierarchy_contract import build_hierarchy_contract
 from exp.cxr_pt.hierarchy_dataset import (
     HierarchyJsonlDataset,
+    box_to_grid_coordinates,
     build_hierarchy_manifest,
     compute_anatomy_pos_weights,
     hierarchy_collate_fn,
@@ -77,6 +78,7 @@ class HierarchyDatasetTest(unittest.TestCase):
         self.assertEqual(len(dataset), 1)
         item = dataset[0]
         self.assertEqual(item["anatomy_targets"].shape, (2, 16))
+        self.assertEqual(item["anatomy_boxes"].shape, (2, 4))
         self.assertEqual(item["finding_targets"].shape, (2, 1))
         self.assertEqual(item["global_targets"].shape, (3,))
         self.assertTrue(item["anatomy_annotation_mask"].all())
@@ -99,6 +101,7 @@ class HierarchyDatasetTest(unittest.TestCase):
         batch = next(iter(loader))
         self.assertEqual(batch["pixel_values"].shape, (1, 3, 8, 8))
         self.assertEqual(batch["gt_anatomy_masks"].shape, (1, 2, 16))
+        self.assertEqual(batch["anatomy_boxes"].shape, (1, 2, 4))
         self.assertEqual(batch["compatibility_mask"].tolist(), [[True], [True]])
         self.assertEqual(batch["encoded_global_prompts"]["input_ids"].shape, (3, 1))
 
@@ -143,6 +146,10 @@ class HierarchyDatasetTest(unittest.TestCase):
             dtype=torch.float,
         )
         self.assertTrue(torch.equal(mask, expected))
+
+    def test_box_coordinates_preserve_subgrid_geometry_and_clip(self):
+        coordinates = box_to_grid_coordinates([-10, 25, 75, 120], 100, 100, 4, 4)
+        torch.testing.assert_close(coordinates, torch.tensor([0.0, 1.0, 3.0, 4.0]))
 
 
 if __name__ == "__main__":

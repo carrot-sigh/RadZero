@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import roi_align
 
 from .vlcabs import VLCABS, VLCABSOutput
 
@@ -163,6 +164,134 @@ class FindingRecognitionOutput:
     pair_mask: torch.Tensor
 
 
+class FeatureROIExtractor(nn.Module):
+    """Extract fixed-resolution anatomy features from a full patch grid."""
+
+    def __init__(self, output_size=14, context_margin=0.0, aligned=True):
+        super().__init__()
+        if not isinstance(output_size, int) or output_size <= 0:
+            raise ValueError("Feature ROI output_size must be a positive integer.")
+        if context_margin < 0:
+            raise ValueError("Feature ROI context_margin must be non-negative.")
+        self.output_size = output_size
+        self.context_margin = float(context_margin)
+        self.aligned = aligned
+
+    def forward(self, visual_tokens, anatomy_boxes, anatomy_valid_mask=None):
+        if visual_tokens.dim() != 3:
+            raise ValueError("visual_tokens must have shape [B, L, D].")
+        batch_size, token_count, hidden_dim = visual_tokens.shape
+        grid_size = math.isqrt(token_count)
+        if grid_size * grid_size != token_count:
+            raise ValueError("Feature ROI requires a square visual-token grid.")
+        if anatomy_boxes.dim() != 3 or anatomy_boxes.shape[0] != batch_size:
+            raise ValueError("anatomy_boxes must have shape [B, A, 4].")
+        if anatomy_boxes.size(-1) != 4:
+            raise ValueError("anatomy_boxes must have shape [B, A, 4].")
+
+        boxes = anatomy_boxes.to(device=visual_tokens.device, dtype=torch.float32)
+        boxes = self._expand_and_clip(boxes, grid_size, grid_size)
+        finite = torch.isfinite(boxes).all(dim=-1)
+        valid = (
+            finite & (boxes[..., 2] > boxes[..., 0]) & (boxes[..., 3] > boxes[..., 1])
+        )
+        if anatomy_valid_mask is not None:
+            valid = valid & _expand_bool_mask(
+                anatomy_valid_mask,
+                valid.shape,
+                "anatomy_valid_mask",
+                visual_tokens.device,
+            )
+
+        safe_boxes = boxes.clone()
+        safe_boxes[~valid] = safe_boxes.new_tensor([0.0, 0.0, 1.0, 1.0])
+        batch_indices = (
+            torch.arange(batch_size, device=visual_tokens.device)
+            .view(-1, 1)
+            .expand_as(valid)
+            .reshape(-1, 1)
+            .to(dtype=safe_boxes.dtype)
+        )
+        rois = torch.cat([batch_indices, safe_boxes.reshape(-1, 4)], dim=-1)
+        feature_map = visual_tokens.transpose(1, 2).reshape(
+            batch_size, hidden_dim, grid_size, grid_size
+        )
+        local = roi_align(
+            feature_map.float(),
+            rois,
+            output_size=(self.output_size, self.output_size),
+            spatial_scale=1.0,
+            sampling_ratio=-1,
+            aligned=self.aligned,
+        ).to(dtype=visual_tokens.dtype)
+        local = (
+            local.flatten(2)
+            .transpose(1, 2)
+            .reshape(
+                batch_size,
+                anatomy_boxes.size(1),
+                self.output_size * self.output_size,
+                hidden_dim,
+            )
+        )
+        local = local * valid[..., None, None]
+        return local, valid, boxes
+
+    def _expand_and_clip(self, boxes, width, height):
+        if self.context_margin:
+            centers = (boxes[..., :2] + boxes[..., 2:]) / 2
+            half_sizes = (boxes[..., 2:] - boxes[..., :2]) / 2
+            half_sizes = half_sizes * (1.0 + self.context_margin)
+            boxes = torch.cat([centers - half_sizes, centers + half_sizes], dim=-1)
+        x1, y1, x2, y2 = boxes.unbind(dim=-1)
+        return torch.stack(
+            [
+                x1.clamp(0, width),
+                y1.clamp(0, height),
+                x2.clamp(0, width),
+                y2.clamp(0, height),
+            ],
+            dim=-1,
+        )
+
+
+class FindingLocalRefiner(nn.Module):
+    """Small bottleneck spatial block for local anatomy feature grids."""
+
+    def __init__(self, hidden_dim, bottleneck_dim=128):
+        super().__init__()
+        if bottleneck_dim <= 0:
+            raise ValueError("bottleneck_dim must be positive.")
+        self.hidden_dim = hidden_dim
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.down_projection = nn.Linear(hidden_dim, bottleneck_dim)
+        self.depthwise = nn.Conv2d(
+            bottleneck_dim,
+            bottleneck_dim,
+            kernel_size=3,
+            padding=1,
+            groups=bottleneck_dim,
+        )
+        self.channel_mixing = nn.Conv2d(bottleneck_dim, bottleneck_dim, 1)
+        self.output_projection = nn.Linear(bottleneck_dim, hidden_dim)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(self, tokens, grid_size):
+        if tokens.dim() != 3 or tokens.size(-1) != self.hidden_dim:
+            raise ValueError("Local-refiner tokens must have shape [N, L, D].")
+        if tokens.size(1) != grid_size * grid_size:
+            raise ValueError("Local-refiner token count must match grid_size squared.")
+        residual = tokens
+        features = self.down_projection(self.input_norm(tokens))
+        features = features.transpose(1, 2).reshape(
+            tokens.size(0), -1, grid_size, grid_size
+        )
+        features = self.channel_mixing(F.gelu(self.depthwise(features)))
+        features = features.flatten(2).transpose(1, 2)
+        return residual + self.output_projection(F.gelu(features))
+
+
 class AnatomyMaskedFindingHead(nn.Module):
     """Run VL-CABS for each valid anatomy-finding pair."""
 
@@ -273,6 +402,75 @@ class AnatomyMaskedFindingHead(nn.Module):
         return FindingRecognitionOutput(
             similarity_scores=similarity_scores,
             masked_similarity_scores=masked_scores,
+            attention_weights=attention_weights,
+            evidence_tokens=evidence_tokens,
+            matching_scores=matching_scores,
+            finding_logits=finding_logits,
+            pair_mask=valid_pairs,
+        )
+
+    def forward_local(
+        self,
+        finding_queries,
+        local_tokens,
+        anatomy_valid_mask=None,
+        compatibility_mask=None,
+        finding_chunk_size=None,
+    ):
+        """Recognize findings from anatomy-specific local token grids."""
+        if local_tokens.dim() != 4 or local_tokens.size(-1) != self.hidden_dim:
+            raise ValueError("local_tokens must have shape [B, A, K, D].")
+        batch_size, anatomy_count, token_count, _ = local_tokens.shape
+        queries = _expand_queries(
+            finding_queries, batch_size, self.hidden_dim, "finding_queries"
+        )
+        if queries.size(1) != self.num_findings:
+            raise ValueError(
+                f"Expected {self.num_findings} finding queries, got {queries.size(1)}."
+            )
+        valid_anatomies = _expand_bool_mask(
+            anatomy_valid_mask,
+            (batch_size, anatomy_count),
+            "anatomy_valid_mask",
+            local_tokens.device,
+        )
+        valid_pairs = self._prepare_compatibility_mask(
+            compatibility_mask, batch_size, anatomy_count, local_tokens.device
+        ) & valid_anatomies.unsqueeze(-1)
+        chunk_size = finding_chunk_size or self.finding_chunk_size or self.num_findings
+        outputs = []
+        normalized_tokens = F.normalize(local_tokens, dim=-1)
+        for start in range(0, self.num_findings, chunk_size):
+            stop = min(start + chunk_size, self.num_findings)
+            normalized_queries = F.normalize(queries[:, start:stop], dim=-1)
+            similarity = torch.einsum(
+                "bfd,bakd->bafk", normalized_queries, normalized_tokens
+            )
+            pair_mask = valid_pairs[:, :, start:stop]
+            attention = torch.softmax(
+                similarity / _bounded_temperature(self.log_attention_temperature),
+                dim=-1,
+            )
+            attention = attention * pair_mask.unsqueeze(-1)
+            evidence = torch.einsum("bafk,bakd->bafd", attention, local_tokens)
+            matching = F.cosine_similarity(
+                evidence,
+                queries[:, None, start:stop, :],
+                dim=-1,
+            )
+            outputs.append((similarity, attention, evidence, matching))
+
+        similarity_scores = torch.cat([item[0] for item in outputs], dim=2)
+        attention_weights = torch.cat([item[1] for item in outputs], dim=2)
+        evidence_tokens = torch.cat([item[2] for item in outputs], dim=2)
+        matching_scores = torch.cat([item[3] for item in outputs], dim=2)
+        finding_logits = matching_scores / _bounded_temperature(
+            self.log_logit_temperature
+        ) + self.finding_bias.view(1, 1, -1)
+        finding_logits = finding_logits * valid_pairs
+        return FindingRecognitionOutput(
+            similarity_scores=similarity_scores,
+            masked_similarity_scores=similarity_scores,
             attention_weights=attention_weights,
             evidence_tokens=evidence_tokens,
             matching_scores=matching_scores,

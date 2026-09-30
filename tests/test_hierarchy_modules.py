@@ -6,7 +6,9 @@ import torch.nn.functional as F
 from exp.cxr_pt.model.hierarchy import (
     AnatomyGroundingHead,
     AnatomyMaskedFindingHead,
+    FeatureROIExtractor,
     FindingEvidenceAggregator,
+    FindingLocalRefiner,
     GatedEvidenceFusion,
     GlobalEvidenceBranch,
 )
@@ -63,6 +65,65 @@ class HierarchyModulesTest(unittest.TestCase):
         valid = expanded_token_mask & anatomy_query_mask.view(1, -1, 1)
         torch.testing.assert_close(
             output.roi_mask_logits[valid], output.similarity_scores[valid]
+        )
+
+    def test_feature_roi_extracts_known_spatial_region(self):
+        visual_tokens = torch.arange(16.0).reshape(1, 16, 1)
+        boxes = torch.tensor([[[1.0, 1.0, 3.0, 3.0]]])
+
+        local, valid, clipped = FeatureROIExtractor(output_size=2)(visual_tokens, boxes)
+
+        self.assertEqual(local.shape, (1, 1, 4, 1))
+        torch.testing.assert_close(local.flatten(), torch.tensor([5.0, 6.0, 9.0, 10.0]))
+        self.assertTrue(valid.item())
+        torch.testing.assert_close(clipped, boxes)
+
+    def test_feature_roi_shape_and_local_finding_contract(self):
+        batch_size, anatomy_count, hidden_dim = 2, 36, 8
+        visual_tokens = torch.randn(batch_size, 37 * 37, hidden_dim)
+        boxes = torch.tensor([1.0, 2.0, 30.0, 35.0]).repeat(
+            batch_size, anatomy_count, 1
+        )
+        local, valid, _ = FeatureROIExtractor(output_size=14)(visual_tokens, boxes)
+        refiner = FindingLocalRefiner(hidden_dim, bottleneck_dim=4)
+        refined = refiner(local.reshape(-1, 14 * 14, hidden_dim), 14).reshape_as(local)
+        head = AnatomyMaskedFindingHead(hidden_dim, self.finding_count)
+        output = head.forward_local(
+            self.finding_queries,
+            refined,
+            anatomy_valid_mask=valid,
+        )
+
+        self.assertEqual(local.shape, (batch_size, anatomy_count, 14 * 14, hidden_dim))
+        self.assertEqual(
+            output.attention_weights.shape,
+            (batch_size, anatomy_count, self.finding_count, 14 * 14),
+        )
+        self.assertEqual(
+            output.evidence_tokens.shape,
+            (batch_size, anatomy_count, self.finding_count, hidden_dim),
+        )
+        self.assertEqual(
+            output.finding_logits.shape,
+            (batch_size, anatomy_count, self.finding_count),
+        )
+
+    def test_feature_roi_invalid_boxes_are_finite_and_masked(self):
+        visual_tokens = torch.randn(1, 16, self.hidden_dim)
+        boxes = torch.tensor([[[2.0, 2.0, 2.0, 3.0], [float("nan"), 0.0, 1.0, 1.0]]])
+        local, valid, _ = FeatureROIExtractor(output_size=2)(visual_tokens, boxes)
+        head = AnatomyMaskedFindingHead(self.hidden_dim, self.finding_count)
+        output = head.forward_local(
+            self.finding_queries,
+            local,
+            anatomy_valid_mask=valid,
+        )
+
+        self.assertFalse(valid.any())
+        self.assertTrue(torch.isfinite(local).all())
+        self.assertTrue(torch.isfinite(output.finding_logits).all())
+        self.assertTrue(
+            torch.equal(output.finding_logits, torch.zeros_like(output.finding_logits))
         )
 
     def test_anatomy_roi_refiner_consumes_shared_similarity_map(self):

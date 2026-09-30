@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import torch
@@ -6,8 +7,10 @@ from .hierarchy import (
     AnatomyGroundingHead,
     AnatomyGroundingOutput,
     AnatomyMaskedFindingHead,
+    FeatureROIExtractor,
     FindingAggregationOutput,
     FindingEvidenceAggregator,
+    FindingLocalRefiner,
     FindingRecognitionOutput,
     GatedEvidenceFusion,
     GatedFusionOutput,
@@ -41,6 +44,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
     pretrained_missing_key_prefixes = (
         "anatomy_head.",
         "finding_head.",
+        "finding_local_refiner.",
         "finding_aggregator.",
         "global_branch.",
         "evidence_fusion.",
@@ -76,6 +80,28 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             logit_temperature=hierarchy_config.get("finding_logit_temperature", 0.07),
             finding_chunk_size=hierarchy_config.get("finding_chunk_size"),
             empty_mask_policy=empty_mask_policy,
+        )
+        self.finding_roi_strategy = hierarchy_config.get(
+            "finding_roi_strategy", "masked_attention"
+        )
+        supported_roi_strategies = {
+            "masked_attention",
+            "full",
+            "full_refiner",
+            "feature_roi",
+        }
+        if self.finding_roi_strategy not in supported_roi_strategies:
+            raise ValueError(
+                "hierarchy_config.finding_roi_strategy must be one of "
+                f"{sorted(supported_roi_strategies)}."
+            )
+        self.feature_roi_extractor = FeatureROIExtractor(
+            output_size=hierarchy_config.get("feature_roi_size", 14),
+            context_margin=hierarchy_config.get("feature_roi_context_margin", 0.0),
+        )
+        self.finding_local_refiner = FindingLocalRefiner(
+            self.hidden_size,
+            bottleneck_dim=hierarchy_config.get("finding_local_refiner_dim", 128),
         )
         self.finding_aggregator = FindingEvidenceAggregator(
             self.hidden_size,
@@ -113,6 +139,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         compatibility_mask=None,
         anatomy_mask_override=None,
         gt_anatomy_masks=None,
+        anatomy_boxes=None,
         teacher_forcing_ratio=None,
         detach_anatomy_masks=False,
         finding_chunk_size=None,
@@ -148,6 +175,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             compatibility_mask=compatibility_mask,
             anatomy_mask_override=anatomy_mask_override,
             gt_anatomy_masks=gt_anatomy_masks,
+            anatomy_boxes=anatomy_boxes,
             teacher_forcing_ratio=teacher_forcing_ratio,
             detach_anatomy_masks=detach_anatomy_masks,
             finding_chunk_size=finding_chunk_size,
@@ -175,6 +203,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         compatibility_mask=None,
         anatomy_mask_override=None,
         gt_anatomy_masks=None,
+        anatomy_boxes=None,
         teacher_forcing_ratio=None,
         detach_anatomy_masks=False,
         finding_chunk_size=None,
@@ -217,11 +246,13 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             teacher_forcing_ratio,
             detach_anatomy_masks,
         )
-        finding = self.finding_head(
-            finding_queries,
-            visual_tokens,
-            anatomy_masks_used,
+        finding = self._forward_finding_branch(
+            finding_queries=finding_queries,
+            visual_tokens=visual_tokens,
+            anatomy_masks=anatomy_masks_used,
+            anatomy_boxes=anatomy_boxes,
             anatomy_query_mask=anatomy_query_mask,
+            anatomy_annotation_mask=anatomy_annotation_mask,
             compatibility_mask=compatibility_mask,
             finding_chunk_size=finding_chunk_size,
         )
@@ -393,9 +424,68 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         return self._select_anatomy_masks(predicted_masks, override, detach)
 
     def configure_hierarchy_training(self, stage=None):
-        modules = self.training_controller.configure_model(self, stage=stage)
+        modules = list(self.training_controller.configure_model(self, stage=stage))
+        if self.training_controller.stage in {
+            "finding",
+            "joint",
+        } and self.finding_roi_strategy in {"feature_roi", "full_refiner"}:
+            for parameter in self.finding_local_refiner.parameters():
+                parameter.requires_grad = True
+            modules.append("finding_local_refiner")
         self.train(self.training)
-        return modules
+        return tuple(modules)
+
+    def _forward_finding_branch(
+        self,
+        finding_queries,
+        visual_tokens,
+        anatomy_masks,
+        anatomy_boxes,
+        anatomy_query_mask,
+        anatomy_annotation_mask,
+        compatibility_mask,
+        finding_chunk_size,
+    ):
+        strategy = self.finding_roi_strategy
+        if strategy == "feature_roi":
+            if anatomy_boxes is None:
+                raise ValueError("feature_roi requires GT or predicted anatomy_boxes.")
+            local_tokens, valid_boxes, _ = self.feature_roi_extractor(
+                visual_tokens,
+                anatomy_boxes,
+                anatomy_annotation_mask,
+            )
+            batch_size, anatomy_count, token_count, hidden_dim = local_tokens.shape
+            local_tokens = self.finding_local_refiner(
+                local_tokens.reshape(-1, token_count, hidden_dim),
+                self.feature_roi_extractor.output_size,
+            ).reshape(batch_size, anatomy_count, token_count, hidden_dim)
+            return self.finding_head.forward_local(
+                finding_queries,
+                local_tokens,
+                anatomy_valid_mask=valid_boxes,
+                compatibility_mask=compatibility_mask,
+                finding_chunk_size=finding_chunk_size,
+            )
+
+        finding_visual_tokens = visual_tokens
+        if strategy == "full_refiner":
+            grid_size = math.isqrt(visual_tokens.size(1))
+            if grid_size * grid_size != visual_tokens.size(1):
+                raise ValueError("full_refiner requires a square visual-token grid.")
+            finding_visual_tokens = self.finding_local_refiner(visual_tokens, grid_size)
+        if strategy in {"full", "full_refiner"}:
+            anatomy_masks = visual_tokens.new_ones(
+                visual_tokens.size(0), anatomy_masks.size(1), visual_tokens.size(1)
+            )
+        return self.finding_head(
+            finding_queries,
+            finding_visual_tokens,
+            anatomy_masks,
+            anatomy_query_mask=anatomy_query_mask,
+            compatibility_mask=compatibility_mask,
+            finding_chunk_size=finding_chunk_size,
+        )
 
     def train(self, mode=True):
         super().train(mode)

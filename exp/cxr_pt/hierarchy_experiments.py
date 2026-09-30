@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import random
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import ImageDraw
 
 from common.utils import Config
 from exp.cxr_pt.hierarchy_dataset import HierarchyJsonlDataset, hierarchy_collate_fn
@@ -108,9 +110,10 @@ def _finding_statistics(logits, targets, valid, labels):
     }
     finding_count = logits.size(-1)
     pair_metrics = multilabel_metrics(
-        torch.sigmoid(logits).reshape(-1, finding_count),
-        targets.reshape(-1, finding_count),
+        torch.sigmoid(logits).float().reshape(-1, finding_count),
+        targets.float().reshape(-1, finding_count),
         valid.reshape(-1, finding_count),
+        include_per_class=True,
     )
     result.update(
         {
@@ -148,27 +151,70 @@ def _finding_statistics(logits, targets, valid, labels):
                     if class_negative.any()
                     else None
                 ),
+                "auroc": pair_metrics.get(f"auroc_class_{index}"),
+                "auprc": pair_metrics.get(f"auprc_class_{index}"),
             }
         )
     return result
 
 
 def _finding_forward(model, features):
-    output = model.finding_head(
-        features["finding_queries"],
-        features["visual_tokens"],
-        features["anatomy_masks"],
-        anatomy_query_mask=features["anatomy_query_mask"],
-        compatibility_mask=features["compatibility_mask"],
-    )
-    loss = model.hierarchy_loss(
-        None,
-        output.finding_logits,
-        None,
-        finding_targets=features["finding_targets"],
-        finding_valid_mask=features["finding_valid_mask"],
-        finding_pair_mask=output.pair_mask,
-    ).finding_loss
+    device_type = features["visual_tokens"].device.type
+    with torch.autocast(
+        device_type=device_type,
+        dtype=torch.bfloat16,
+        enabled=device_type == "cuda",
+    ):
+        if features["finding_roi_strategy"] == "feature_roi":
+            local_tokens, valid_boxes, _ = model.feature_roi_extractor(
+                features["visual_tokens"],
+                features["anatomy_boxes"],
+                features["anatomy_annotation_mask"],
+            )
+            batch_size, anatomy_count, token_count, hidden_dim = local_tokens.shape
+            local_tokens = model.finding_local_refiner(
+                local_tokens.reshape(-1, token_count, hidden_dim),
+                model.feature_roi_extractor.output_size,
+            ).reshape(batch_size, anatomy_count, token_count, hidden_dim)
+            output = model.finding_head.forward_local(
+                features["finding_queries"],
+                local_tokens,
+                anatomy_valid_mask=valid_boxes,
+                compatibility_mask=features["compatibility_mask"],
+            )
+        elif features["finding_roi_strategy"] == "full_refiner":
+            grid_size = math.isqrt(features["visual_tokens"].size(1))
+            refined_tokens = model.finding_local_refiner(
+                features["visual_tokens"], grid_size
+            )
+            full_masks = features["visual_tokens"].new_ones(
+                features["visual_tokens"].size(0),
+                features["anatomy_masks"].size(1),
+                features["visual_tokens"].size(1),
+            )
+            output = model.finding_head(
+                features["finding_queries"],
+                refined_tokens,
+                full_masks,
+                anatomy_query_mask=features["anatomy_query_mask"],
+                compatibility_mask=features["compatibility_mask"],
+            )
+        else:
+            output = model.finding_head(
+                features["finding_queries"],
+                features["visual_tokens"],
+                features["anatomy_masks"],
+                anatomy_query_mask=features["anatomy_query_mask"],
+                compatibility_mask=features["compatibility_mask"],
+            )
+        loss = model.hierarchy_loss(
+            None,
+            output.finding_logits,
+            None,
+            finding_targets=features["finding_targets"],
+            finding_valid_mask=features["finding_valid_mask"],
+            finding_pair_mask=output.pair_mask,
+        ).finding_loss
     return output, loss
 
 
@@ -226,6 +272,96 @@ def _select_roi_masks(model, batch, visual_tokens, anatomy_queries, args):
     raise ValueError(f"Unsupported ROI mode: {args.roi_mode}")
 
 
+def _select_roi_boxes(batch, args):
+    boxes = batch["anatomy_boxes"]
+    if args.roi_mode == "gt":
+        return boxes, None
+    if args.roi_mode == "shuffled":
+        permutation = torch.roll(
+            torch.arange(boxes.size(0), device=boxes.device), shifts=1
+        )
+        return boxes[permutation], permutation.cpu().tolist()
+    raise ValueError(
+        "Feature ROI supports --roi-mode gt or shuffled; " f"got {args.roi_mode!r}."
+    )
+
+
+def _prepare_stage2_features(model, batch, args, device):
+    model.eval()
+    with torch.no_grad(), torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=device.type == "cuda",
+    ):
+        vision = model.forward_vision_model(batch["pixel_values"])
+        finding_queries = model._encode_prompt_bank(
+            batch["encoded_finding_prompts"], model.num_findings, "finding"
+        )
+        if args.finding_roi_strategy == "feature_roi":
+            anatomy_masks = batch["gt_anatomy_masks"]
+            anatomy_boxes, roi_permutation = _select_roi_boxes(batch, args)
+        elif args.finding_roi_strategy in {"full", "full_refiner"}:
+            anatomy_masks = torch.ones_like(batch["gt_anatomy_masks"])
+            anatomy_boxes = batch["anatomy_boxes"]
+            roi_permutation = None
+        else:
+            anatomy_queries = None
+            if args.roi_mode == "predicted":
+                anatomy_queries = model._encode_prompt_bank(
+                    batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy"
+                )
+            anatomy_masks, roi_permutation = _select_roi_masks(
+                model,
+                batch,
+                vision["image_patch_tokens"],
+                anatomy_queries,
+                args,
+            )
+            anatomy_boxes = batch["anatomy_boxes"]
+    return {
+        "finding_roi_strategy": args.finding_roi_strategy,
+        "visual_tokens": vision["image_patch_tokens"].detach(),
+        "finding_queries": finding_queries.detach(),
+        "anatomy_masks": anatomy_masks.detach(),
+        "anatomy_boxes": anatomy_boxes.detach(),
+        "anatomy_annotation_mask": batch["anatomy_annotation_mask"],
+        "anatomy_query_mask": batch["anatomy_query_mask"],
+        "compatibility_mask": batch["compatibility_mask"],
+        "finding_targets": batch["finding_targets"],
+        "finding_valid_mask": batch["finding_valid_mask"],
+        "roi_permutation": roi_permutation,
+    }
+
+
+def _move_feature_batch(features, device):
+    return {
+        key: _to_device(value, device)
+        for key, value in features.items()
+        if key != "roi_permutation"
+    }
+
+
+def _cache_stage2_features(model, dataset, indices, batch_size, models, args, device):
+    cached = []
+    for start in range(0, len(indices), batch_size):
+        samples = [dataset[index] for index in indices[start : start + batch_size]]
+        batch = hierarchy_collate_fn(
+            samples,
+            tokenizer=models["tokenizer"],
+            image_processor=models["image_processor"],
+            contract_path=dataset.contract_path,
+        )
+        batch = _to_device(batch, device)
+        features = _prepare_stage2_features(model, batch, args, device)
+        cached.append(
+            {
+                key: value.detach().cpu() if torch.is_tensor(value) else value
+                for key, value in features.items()
+            }
+        )
+    return cached
+
+
 def run_stage2_tiny_overfit(args):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -233,6 +369,8 @@ def run_stage2_tiny_overfit(args):
     device = torch.device(args.device)
     config = _load_config(args.config, args.config_overrides)
     hierarchy_config = config["dataset"]["hierarchy"]
+    model_hierarchy_config = config["model"]["model_config"]["hierarchy_config"]
+    model_hierarchy_config["finding_roi_strategy"] = args.finding_roi_strategy
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     models = load_model(config["model"], output_dir=str(output_dir))
@@ -271,17 +409,25 @@ def run_stage2_tiny_overfit(args):
             anatomy_queries = model._encode_prompt_bank(
                 batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy"
             )
-        anatomy_masks, roi_permutation = _select_roi_masks(
-            model,
-            batch,
-            vision["image_patch_tokens"],
-            anatomy_queries,
-            args,
-        )
+        if args.finding_roi_strategy == "feature_roi":
+            anatomy_masks = batch["gt_anatomy_masks"]
+            anatomy_boxes, roi_permutation = _select_roi_boxes(batch, args)
+        else:
+            anatomy_masks, roi_permutation = _select_roi_masks(
+                model,
+                batch,
+                vision["image_patch_tokens"],
+                anatomy_queries,
+                args,
+            )
+            anatomy_boxes = batch["anatomy_boxes"]
     features = {
+        "finding_roi_strategy": args.finding_roi_strategy,
         "visual_tokens": vision["image_patch_tokens"].detach(),
         "finding_queries": finding_queries.detach(),
         "anatomy_masks": anatomy_masks.detach(),
+        "anatomy_boxes": anatomy_boxes.detach(),
+        "anatomy_annotation_mask": batch["anatomy_annotation_mask"],
         "anatomy_query_mask": batch["anatomy_query_mask"],
         "compatibility_mask": batch["compatibility_mask"],
         "finding_targets": batch["finding_targets"],
@@ -297,8 +443,13 @@ def run_stage2_tiny_overfit(args):
     trainable_names = [
         name for name, parameter in model.named_parameters() if parameter.requires_grad
     ]
+    allowed_trainable_prefixes = (
+        ("finding_head.", "finding_local_refiner.")
+        if args.finding_roi_strategy in {"feature_roi", "full_refiner"}
+        else ("finding_head.",)
+    )
     if not trainable_names or not all(
-        name.startswith("finding_head.") for name in trainable_names
+        name.startswith(allowed_trainable_prefixes) for name in trainable_names
     ):
         raise RuntimeError(
             f"Unexpected Stage 2 trainable parameters: {trainable_names}"
@@ -335,7 +486,8 @@ def run_stage2_tiny_overfit(args):
             raise RuntimeError(f"Non-finite Stage 2 loss at step {step}: {loss.item()}")
         loss.backward()
         gradient_norm = torch.nn.utils.clip_grad_norm_(
-            model.finding_head.parameters(), args.max_grad_norm
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            args.max_grad_norm,
         )
         if not torch.isfinite(gradient_norm):
             raise RuntimeError(f"Non-finite gradient norm at step {step}.")
@@ -374,6 +526,7 @@ def run_stage2_tiny_overfit(args):
     final["finding_bias"] = model.finding_head.finding_bias.detach().float().tolist()
     report = {
         "experiment": "stage2_roi_tiny_overfit",
+        "finding_roi_strategy": args.finding_roi_strategy,
         "roi_mode": args.roi_mode,
         "anatomy_checkpoint": args.anatomy_checkpoint,
         "roi_permutation": roi_permutation,
@@ -404,7 +557,15 @@ def run_stage2_tiny_overfit(args):
     report_path = output_dir / "stage2_real_smoke.json"
     checkpoint_path = output_dir / "finding_head.pt"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    torch.save(model.finding_head.state_dict(), checkpoint_path)
+    torch.save(
+        model.finding_head.state_dict(),
+        checkpoint_path,
+    )
+    if args.finding_roi_strategy in {"feature_roi", "full_refiner"}:
+        torch.save(
+            model.finding_local_refiner.state_dict(),
+            output_dir / "finding_local_refiner.pt",
+        )
     print(
         json.dumps(
             {
@@ -424,6 +585,317 @@ def run_stage2_tiny_overfit(args):
         )
     )
     return report
+
+
+def _evaluate_stage2_cached(model, cached, dataset, device):
+    labels = dataset.contract["finding"]["labels"]
+    losses = []
+    logits = []
+    targets = []
+    valid_masks = []
+    model.eval()
+    with torch.no_grad():
+        for cpu_features in cached:
+            features = _move_feature_batch(cpu_features, device)
+            output, loss = _finding_forward(model, features)
+            losses.append(float(loss.float().item()))
+            logits.append(output.finding_logits.detach().cpu())
+            targets.append(features["finding_targets"].detach().cpu())
+            valid_masks.append(
+                (features["finding_valid_mask"] & output.pair_mask).detach().cpu()
+            )
+    logits = torch.cat(logits, dim=0)
+    targets = torch.cat(targets, dim=0)
+    valid_masks = torch.cat(valid_masks, dim=0)
+    statistics = _finding_statistics(logits, targets, valid_masks, labels)
+    statistics["loss"] = float(sum(losses) / len(losses))
+    return statistics
+
+
+def _save_feature_roi_visualizations(
+    model, cached_features, dataset, indices, output_dir, device
+):
+    """Save bbox/grid/local-attention overlays for a few validation images."""
+    if not cached_features:
+        return []
+    contract = dataset.contract
+    anatomy_labels = contract["anatomy"]["labels"]
+    finding_labels = contract["finding"]["labels"]
+    selected_anatomies = (
+        "right upper lung zone",
+        "right lower lung zone",
+        "left lower lung zone",
+        "cardiac silhouette",
+    )
+    finding_index = (
+        finding_labels.index("lung opacity") if "lung opacity" in finding_labels else 0
+    )
+    features = _move_feature_batch(cached_features[0], device)
+    model.eval()
+    with torch.no_grad():
+        output, _ = _finding_forward(model, features)
+    attention = output.attention_weights.float().cpu()
+    boxes = features["anatomy_boxes"].float().cpu()
+    valid = features["anatomy_annotation_mask"].cpu()
+    saved = []
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for batch_index, dataset_index in enumerate(indices[: attention.size(0)]):
+        item = dataset[dataset_index]
+        image = item["image"].convert("RGB")
+        width, height = image.size
+        scale_x = width / dataset.patch_grid_size[1]
+        scale_y = height / dataset.patch_grid_size[0]
+        overlay = image.copy()
+        draw = ImageDraw.Draw(overlay, "RGBA")
+        for anatomy_name in selected_anatomies:
+            anatomy_index = anatomy_labels.index(anatomy_name)
+            if not valid[batch_index, anatomy_index]:
+                continue
+            x1, y1, x2, y2 = boxes[batch_index, anatomy_index].tolist()
+            px1, py1, px2, py2 = (
+                x1 * scale_x,
+                y1 * scale_y,
+                x2 * scale_x,
+                y2 * scale_y,
+            )
+            draw.rectangle((px1, py1, px2, py2), outline=(0, 255, 0, 255), width=8)
+            local_attention = attention[batch_index, anatomy_index, finding_index]
+            local_size = math.isqrt(local_attention.numel())
+            local_attention = local_attention.reshape(local_size, local_size)
+            local_attention = local_attention / local_attention.max().clamp_min(1e-6)
+            for row in range(local_size):
+                for col in range(local_size):
+                    alpha = int(180 * local_attention[row, col].item())
+                    cell_x1 = px1 + (px2 - px1) * col / local_size
+                    cell_y1 = py1 + (py2 - py1) * row / local_size
+                    cell_x2 = px1 + (px2 - px1) * (col + 1) / local_size
+                    cell_y2 = py1 + (py2 - py1) * (row + 1) / local_size
+                    draw.rectangle(
+                        (cell_x1, cell_y1, cell_x2, cell_y2),
+                        fill=(255, 40, 0, alpha),
+                    )
+            draw.text((px1 + 4, py1 + 4), anatomy_name, fill=(0, 255, 0, 255))
+        image.thumbnail((1024, 1024))
+        path = output_dir / f"valid-{dataset_index:06d}-lung-opacity.png"
+        overlay.thumbnail((1024, 1024))
+        overlay.save(path)
+        saved.append(str(path))
+    return saved
+
+
+def run_stage2_pilot(args):
+    strategies = args.strategies
+    pilot_reports = []
+    for strategy_index, strategy in enumerate(strategies):
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        device = torch.device(args.device)
+        config = _load_config(args.config, args.config_overrides)
+        config["model"]["model_config"]["hierarchy_config"][
+            "finding_roi_strategy"
+        ] = strategy
+        config["model"]["model_config"]["hierarchy_config"][
+            "feature_roi_context_margin"
+        ] = args.context_margin
+        output_dir = Path(args.output_dir) / strategy
+        output_dir.mkdir(parents=True, exist_ok=True)
+        models = load_model(config["model"], output_dir=str(output_dir))
+        model = models["model"].to(device)
+        model.configure_hierarchy_training("finding")
+        hierarchy_config = config["dataset"]["hierarchy"]
+        train_dataset = HierarchyJsonlDataset(
+            hierarchy_config["manifest_path"],
+            hierarchy_config["image_root"],
+            hierarchy_config["contract_path"],
+            split=hierarchy_config.get("train_split", "train"),
+            patch_grid_size=hierarchy_config["patch_grid_size"],
+        )
+        valid_dataset = HierarchyJsonlDataset(
+            hierarchy_config["manifest_path"],
+            hierarchy_config["image_root"],
+            hierarchy_config["contract_path"],
+            split=hierarchy_config.get("eval_split", "valid"),
+            patch_grid_size=hierarchy_config["patch_grid_size"],
+        )
+        train_indices = _select_balanced_indices(
+            train_dataset, args.train_images, args.seed
+        )
+        valid_indices = _select_balanced_indices(
+            valid_dataset, args.valid_images, args.seed + 1
+        )
+        strategy_args = SimpleNamespace(
+            finding_roi_strategy=strategy,
+            roi_mode=args.roi_mode,
+            anatomy_checkpoint=None,
+        )
+        train_cached = _cache_stage2_features(
+            model,
+            train_dataset,
+            train_indices,
+            args.batch_size,
+            models,
+            strategy_args,
+            device,
+        )
+        valid_cached = _cache_stage2_features(
+            model,
+            valid_dataset,
+            valid_indices,
+            args.batch_size,
+            models,
+            strategy_args,
+            device,
+        )
+        trainable_names = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        ]
+        allowed = (
+            ("finding_head.", "finding_local_refiner.")
+            if strategy in {"feature_roi", "full_refiner"}
+            else ("finding_head.",)
+        )
+        if not trainable_names or not all(
+            name.startswith(allowed) for name in trainable_names
+        ):
+            raise RuntimeError(
+                f"Unexpected pilot trainable parameters: {trainable_names}"
+            )
+        optimizer = torch.optim.AdamW(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        validation_start = time.perf_counter()
+        initial = _evaluate_stage2_cached(model, valid_cached, valid_dataset, device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        initial_validation_seconds = time.perf_counter() - validation_start
+        step_times = []
+        history = []
+        model.train()
+        for step in range(args.steps):
+            cpu_features = train_cached[step % len(train_cached)]
+            features = _move_feature_batch(cpu_features, device)
+            optimizer.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            start_time = time.perf_counter()
+            _, loss = _finding_forward(model, features)
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite pilot loss for {strategy} at step {step + 1}."
+                )
+            loss.backward()
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                [
+                    parameter
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                ],
+                args.max_grad_norm,
+            )
+            if not torch.isfinite(gradient_norm):
+                raise RuntimeError(f"Non-finite pilot gradient for {strategy}.")
+            optimizer.step()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            step_times.append(time.perf_counter() - start_time)
+            if step == 0 or (step + 1) % args.log_every == 0 or step + 1 == args.steps:
+                history.append(
+                    {
+                        "step": step + 1,
+                        "loss": float(loss.detach().float().item()),
+                        "gradient_norm": float(gradient_norm.detach().float().item()),
+                    }
+                )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        validation_start = time.perf_counter()
+        final = _evaluate_stage2_cached(model, valid_cached, valid_dataset, device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        final_validation_seconds = time.perf_counter() - validation_start
+        peak_memory = (
+            torch.cuda.max_memory_allocated(device) / (1024**2)
+            if device.type == "cuda"
+            else None
+        )
+        step_seconds = float(sum(step_times) / len(step_times))
+        report = {
+            "strategy": strategy,
+            "seed": args.seed,
+            "train_images": args.train_images,
+            "valid_images": args.valid_images,
+            "steps": args.steps,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "context_margin": args.context_margin,
+            "train_indices": train_indices,
+            "valid_indices": valid_indices,
+            "trainable_parameter_count": sum(
+                parameter.numel()
+                for parameter in model.parameters()
+                if parameter.requires_grad
+            ),
+            "trainable_parameters": trainable_names,
+            "initial_validation": initial,
+            "final_validation": final,
+            "history": history,
+            "step_seconds": step_seconds,
+            "train_samples_per_second": args.batch_size / step_seconds,
+            "validation_samples_per_second": args.valid_images
+            / max(final_validation_seconds, 1e-9),
+            "initial_validation_seconds": initial_validation_seconds,
+            "final_validation_seconds": final_validation_seconds,
+            "peak_gpu_memory_mb": peak_memory,
+            "loss_decreased": final["loss"] < initial["loss"],
+        }
+        if strategy == "feature_roi" and args.roi_mode == "gt":
+            report["visualizations"] = _save_feature_roi_visualizations(
+                model,
+                valid_cached,
+                valid_dataset,
+                valid_indices,
+                output_dir / "visualizations",
+                device,
+            )
+        report_path = output_dir / "stage2_pilot.json"
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        pilot_reports.append(report)
+        del model, models, train_cached, valid_cached
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary = output_dir / "stage2_pilot_summary.json"
+    summary.write_text(json.dumps(pilot_reports, indent=2), encoding="utf-8")
+    print(
+        json.dumps(
+            [
+                {
+                    "strategy": report["strategy"],
+                    "validation_loss": report["final_validation"]["loss"],
+                    "macro_auroc": report["final_validation"]["macro_auroc"],
+                    "macro_auprc": report["final_validation"]["macro_auprc"],
+                    "macro_f1": report["final_validation"]["macro_f1"],
+                    "parameters": report["trainable_parameter_count"],
+                    "peak_gpu_memory_mb": report["peak_gpu_memory_mb"],
+                    "step_seconds": report["step_seconds"],
+                }
+                for report in pilot_reports
+            ],
+            indent=2,
+        )
+    )
+    return pilot_reports
 
 
 def _global_forward(model, features):
@@ -824,11 +1296,42 @@ def main():
         default="gt",
     )
     stage2.add_argument("--anatomy-checkpoint")
+    stage2.add_argument(
+        "--finding-roi-strategy",
+        choices=("masked_attention", "full", "feature_roi", "full_refiner"),
+        default="masked_attention",
+    )
     stage2.add_argument("--learning-rate", type=float, default=1e-2)
     stage2.add_argument("--weight-decay", type=float, default=0.0)
     stage2.add_argument("--max-grad-norm", type=float, default=10.0)
     stage2.add_argument("--log-every", type=int, default=10)
     stage2.add_argument("--seed", type=int, default=20260930)
+    pilot = subparsers.add_parser("stage2-pilot")
+    pilot.add_argument("--config", default="exp/cxr_pt/config.yaml")
+    pilot.add_argument(
+        "--config-overrides",
+        nargs="+",
+        default=["radzero.yaml", "hierarchy.yaml", "paths.yaml"],
+    )
+    pilot.add_argument("--output-dir", default="/home/user/gxq/stage2-validation/pilot")
+    pilot.add_argument("--device", default="cuda:0")
+    pilot.add_argument(
+        "--strategies",
+        nargs="+",
+        default=["full", "masked_attention", "feature_roi", "full_refiner"],
+        choices=("full", "masked_attention", "feature_roi", "full_refiner"),
+    )
+    pilot.add_argument("--train-images", type=int, default=256)
+    pilot.add_argument("--valid-images", type=int, default=128)
+    pilot.add_argument("--batch-size", type=int, default=16)
+    pilot.add_argument("--steps", type=int, default=120)
+    pilot.add_argument("--learning-rate", type=float, default=1e-3)
+    pilot.add_argument("--weight-decay", type=float, default=0.0)
+    pilot.add_argument("--max-grad-norm", type=float, default=10.0)
+    pilot.add_argument("--log-every", type=int, default=20)
+    pilot.add_argument("--seed", type=int, default=20260930)
+    pilot.add_argument("--context-margin", type=float, default=0.0)
+    pilot.add_argument("--roi-mode", choices=("gt", "shuffled"), default="gt")
     stage3 = subparsers.add_parser("stage3-tiny-overfit")
     stage3.add_argument("--config", default="exp/cxr_pt/config.yaml")
     stage3.add_argument(
@@ -851,6 +1354,8 @@ def main():
     args = parser.parse_args()
     if args.experiment == "stage2-tiny-overfit":
         run_stage2_tiny_overfit(args)
+    elif args.experiment == "stage2-pilot":
+        run_stage2_pilot(args)
     elif args.experiment == "stage3-tiny-overfit":
         run_stage3_tiny_overfit(args)
 

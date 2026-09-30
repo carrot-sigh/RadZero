@@ -8,18 +8,20 @@ from common.trainer import logger
 
 from .checkpoint import load_radzero_state_dict
 from .configuration import CxrAlignConfig
+from .hierarchical_modeling import HierarchicalCxrAlignModel, HierarchicalModelOutput
 from .hierarchy import (
     AnatomyGroundingHead,
     AnatomyGroundingOutput,
     AnatomyMaskedFindingHead,
+    FeatureROIExtractor,
     FindingAggregationOutput,
     FindingEvidenceAggregator,
+    FindingLocalRefiner,
     FindingRecognitionOutput,
     GatedEvidenceFusion,
     GatedFusionOutput,
     GlobalEvidenceBranch,
 )
-from .hierarchical_modeling import HierarchicalCxrAlignModel, HierarchicalModelOutput
 from .hierarchy_losses import HierarchyLoss, HierarchyLossOutput
 from .hierarchy_training import HierarchyTrainingController
 from .modeling import CxrAlignModel

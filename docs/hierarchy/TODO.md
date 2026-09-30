@@ -74,3 +74,4 @@
 - [x] Run a real 16-image Stage 3 tiny-overfit and verify frozen upstream state.
 - [x] Run Stage 3 evidence, Finding-logit, and forced-gate interventions on the
   tiny-overfit set.
+- [x] Run the controlled Stage 2 Feature ROI held-out pilot and capacity control.

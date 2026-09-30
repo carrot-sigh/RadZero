@@ -56,7 +56,13 @@ class HierarchyHarness(HierarchicalCxrAlignModel):
         }
 
 
-def make_config(hidden_dim=8, anatomies=3, findings=4, globals_=5):
+def make_config(
+    hidden_dim=8,
+    anatomies=3,
+    findings=4,
+    globals_=5,
+    finding_roi_strategy="masked_attention",
+):
     config = PretrainedConfig()
     config.pretrained_dir = None
     config.vision_config = SimpleNamespace()
@@ -80,6 +86,9 @@ def make_config(hidden_dim=8, anatomies=3, findings=4, globals_=5):
             "num_global_labels": globals_,
             "finding_chunk_size": 2,
             "aggregation_num_heads": 2,
+            "finding_roi_strategy": finding_roi_strategy,
+            "feature_roi_size": 2,
+            "finding_local_refiner_dim": 4,
         },
     }
     return config
@@ -134,6 +143,56 @@ class HierarchicalModelTest(unittest.TestCase):
             output.vision_outputs["image_patch_tokens"],
             self.pixel_values[:, 1:],
         )
+
+    def test_feature_roi_output_flows_into_unchanged_stage3(self):
+        model = HierarchyHarness(
+            make_config(
+                self.hidden_dim,
+                self.anatomies,
+                self.findings,
+                self.globals,
+                finding_roi_strategy="feature_roi",
+            )
+        )
+        boxes = torch.tensor([0.0, 0.0, 3.0, 3.0]).repeat(
+            self.batch_size, self.anatomies, 1
+        )
+        output = model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+            anatomy_boxes=boxes,
+            anatomy_annotation_mask=torch.ones(
+                self.batch_size, self.anatomies, dtype=torch.bool
+            ),
+        )
+
+        self.assertEqual(
+            output.finding.attention_weights.shape,
+            (self.batch_size, self.anatomies, self.findings, 4),
+        )
+        self.assertEqual(
+            output.finding_aggregation.evidence_tokens.shape,
+            (self.batch_size, self.globals, self.hidden_dim),
+        )
+        self.assertEqual(output.fusion.logits.shape, (self.batch_size, self.globals))
+
+    def test_feature_roi_stage_trains_refiner_but_keeps_encoders_frozen(self):
+        model = HierarchyHarness(make_config(finding_roi_strategy="feature_roi"))
+        configured = set(model.configure_hierarchy_training("finding"))
+
+        self.assertEqual(configured, {"finding_head", "finding_local_refiner"})
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in model.finding_local_refiner.parameters()
+            )
+        )
+        for module_name in model.training_controller.ENCODER_MODULES:
+            module = getattr(model, module_name)
+            self.assertFalse(any(p.requires_grad for p in module.parameters()))
+            self.assertFalse(module.training)
 
     def test_mask_override_and_detach_are_explicit(self):
         override = torch.rand(

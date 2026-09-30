@@ -183,6 +183,7 @@ class HierarchyJsonlDataset(Dataset):
     ):
         self.manifest_path = Path(manifest_path)
         self.image_root = Path(image_root)
+        self.contract_path = Path(contract_path)
         self.contract = load_hierarchy_contract(contract_path)
         self.split = split
         if isinstance(patch_grid_size, int):
@@ -225,13 +226,20 @@ class HierarchyJsonlDataset(Dataset):
         grid_height, grid_width = self.patch_grid_size
 
         anatomy_targets = torch.zeros(num_anatomies, grid_height, grid_width)
+        anatomy_boxes = torch.zeros(num_anatomies, 4)
         anatomy_valid = torch.zeros(num_anatomies, dtype=torch.bool)
         for label, box in row["boxes"].items():
             anatomy_index = self.anatomy_index[label]
             anatomy_targets[anatomy_index] = rasterize_box(
                 box, width, height, grid_width, grid_height
             )
-            anatomy_valid[anatomy_index] = True
+            anatomy_boxes[anatomy_index] = box_to_grid_coordinates(
+                box, width, height, grid_width, grid_height
+            )
+            anatomy_valid[anatomy_index] = bool(
+                anatomy_boxes[anatomy_index, 2] > anatomy_boxes[anatomy_index, 0]
+                and anatomy_boxes[anatomy_index, 3] > anatomy_boxes[anatomy_index, 1]
+            )
 
         finding_targets = torch.zeros(num_anatomies, num_findings)
         finding_valid = torch.zeros(num_anatomies, num_findings, dtype=torch.bool)
@@ -251,6 +259,7 @@ class HierarchyJsonlDataset(Dataset):
         return {
             "image": image,
             "anatomy_targets": anatomy_targets.flatten(1),
+            "anatomy_boxes": anatomy_boxes,
             "anatomy_annotation_mask": anatomy_valid,
             "anatomy_query_mask": torch.ones(num_anatomies, dtype=torch.bool),
             "finding_targets": finding_targets,
@@ -324,6 +333,20 @@ def rasterize_box(box, image_width, image_height, grid_width, grid_height):
     return mask
 
 
+def box_to_grid_coordinates(box, image_width, image_height, grid_width, grid_height):
+    """Map an original-image box to continuous feature-grid coordinates."""
+    x1, y1, x2, y2 = box
+    return torch.tensor(
+        [
+            max(0.0, min(float(grid_width), x1 / image_width * grid_width)),
+            max(0.0, min(float(grid_height), y1 / image_height * grid_height)),
+            max(0.0, min(float(grid_width), x2 / image_width * grid_width)),
+            max(0.0, min(float(grid_height), y2 / image_height * grid_height)),
+        ],
+        dtype=torch.float32,
+    )
+
+
 def hierarchy_collate_fn(batch, tokenizer, image_processor, contract_path):
     contract = load_hierarchy_contract(contract_path)
     processed = image_processor([item["image"] for item in batch], return_tensors="pt")
@@ -336,6 +359,7 @@ def hierarchy_collate_fn(batch, tokenizer, image_processor, contract_path):
         output = {"pixel_values": torch.as_tensor(np.asarray(pixel_values))}
     for key in (
         "anatomy_targets",
+        "anatomy_boxes",
         "anatomy_annotation_mask",
         "anatomy_query_mask",
         "finding_targets",

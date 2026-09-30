@@ -12,6 +12,10 @@ model:
       finding_logit_temperature: 0.07
       global_logit_temperature: 0.07
       finding_chunk_size: 8
+      finding_roi_strategy: masked_attention
+      feature_roi_size: 14
+      feature_roi_context_margin: 0.0
+      finding_local_refiner_dim: 128
       aggregation_num_heads: 8
       aggregation_dropout: 0.0
       empty_mask_policy: all
@@ -48,6 +52,7 @@ model:
   module_to_update:
     - anatomy_head
     - finding_head
+    - finding_local_refiner
     - finding_aggregator
     - global_branch
     - evidence_fusion
