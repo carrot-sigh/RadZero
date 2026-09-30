@@ -70,3 +70,7 @@
 - [x] Test full Trainer checkpoint resume (model, optimizer, scheduler, step, stage, RNG).
 - [x] Test the formal hierarchy config loads RadZero and builds the Stage 1 optimizer.
 - [x] Run a real single-image Stage 1 overfit with Dice/IoU and ROI visualizations.
+- [x] Run a real 16-image Stage 2 GT-ROI tiny-overfit with finite-gradient audit.
+- [x] Run a real 16-image Stage 3 tiny-overfit and verify frozen upstream state.
+- [x] Run Stage 3 evidence, Finding-logit, and forced-gate interventions on the
+  tiny-overfit set.

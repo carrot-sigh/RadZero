@@ -62,3 +62,8 @@ current environment rather than a fully solver-reproducible lockfile.
 - [ ] Compare finding-only, global-only, and fused branches.
 - [ ] Add evidence zero-out and shuffle interventions.
 - [ ] Run staged training followed by low-learning-rate joint fine-tuning.
+
+Real-data tiny-overfit and training-set intervention plumbing are documented in
+`STAGE23_REAL_EXPERIMENTS.md`. The items above remain open until the comparisons
+are run against held-out validation data; predicted-ROI evaluation additionally
+requires a reusable multi-image Stage 1 checkpoint.
