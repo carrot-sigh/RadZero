@@ -1323,6 +1323,12 @@ def run_stage3_tiny_overfit(args):
     models = load_model(config["model"], output_dir=str(output_dir))
     model = models["model"].to(device)
     _load_finding_head_checkpoint(model, args.finding_checkpoint)
+    if args.roi_mode == "predicted":
+        if not args.anatomy_checkpoint:
+            raise ValueError(
+                "--anatomy-checkpoint is required for predicted Stage 3 ROI."
+            )
+        _load_anatomy_head_checkpoint(model, args.anatomy_checkpoint)
     model.configure_hierarchy_training("global")
 
     dataset = HierarchyJsonlDataset(
@@ -1354,10 +1360,22 @@ def run_stage3_tiny_overfit(args):
         global_queries = model._encode_prompt_bank(
             batch["encoded_global_prompts"], model.num_global_labels, "global"
         )
+        if args.roi_mode == "predicted":
+            anatomy_queries = model._encode_prompt_bank(
+                batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy"
+            )
+            anatomy_prediction = model.anatomy_head(
+                anatomy_queries,
+                vision["image_patch_tokens"],
+                anatomy_query_mask=batch["anatomy_query_mask"],
+            )
+            finding_masks = anatomy_prediction.roi_masks
+        else:
+            finding_masks = batch["gt_anatomy_masks"]
         finding = model.finding_head(
             finding_queries,
             vision["image_patch_tokens"],
-            batch["gt_anatomy_masks"],
+            finding_masks,
             anatomy_query_mask=batch["anatomy_query_mask"],
             compatibility_mask=batch["compatibility_mask"],
         )
@@ -1463,6 +1481,9 @@ def run_stage3_tiny_overfit(args):
         "seed": args.seed,
         "num_images": args.num_images,
         "steps": args.steps,
+        "roi_mode": args.roi_mode,
+        "anatomy_checkpoint": args.anatomy_checkpoint,
+        "uses_gt_anatomy_masks": args.roi_mode == "gt",
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "finding_checkpoint": args.finding_checkpoint,
@@ -1635,6 +1656,8 @@ def main():
     stage3.add_argument("--log-every", type=int, default=10)
     stage3.add_argument("--seed", type=int, default=20260930)
     stage3.add_argument("--finding-checkpoint", required=True)
+    stage3.add_argument("--roi-mode", choices=("predicted", "gt"), default="predicted")
+    stage3.add_argument("--anatomy-checkpoint")
     args = parser.parse_args()
     if args.experiment == "stage2-tiny-overfit":
         run_stage2_tiny_overfit(args)

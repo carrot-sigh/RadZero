@@ -32,6 +32,11 @@ The primary Stage 2 route is `Stage 1 predicted ROI -> masked_attention`.
 `feature_roi` and `full_refiner` are explicit ablation strategies and are not
 the default production path.
 
+The deployment smoke contract is therefore:
+`CXR -> predicted Anatomy ROI -> Finding -> Global`. GT anatomy masks/boxes
+may be used for teacher forcing or ablations, but must not be required by the
+Finding or Global inference paths.
+
 The trainer must set the hierarchy step from its optimizer global step, not from
 micro-batch count. After loading a training checkpoint, call
 `configure_hierarchy_training()` without a stage argument to reapply the stage

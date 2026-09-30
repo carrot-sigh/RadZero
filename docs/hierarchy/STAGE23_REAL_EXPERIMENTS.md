@@ -67,6 +67,30 @@ run without `--anatomy-checkpoint`.
 
 ## Stage 3 tiny-overfit
 
+## Deployment-aligned predicted-ROI chain
+
+The deployment-aligned chain was also smoke-tested as:
+
+```text
+CXR -> Stage 1 predicted Anatomy ROI -> Stage 2 masked attention Finding
+    -> Stage 3 Global fusion
+```
+
+Stage 2 and Stage 3 consumed predicted masks from the saved Anatomy Head; no
+GT anatomy masks or GT anatomy boxes were passed to either Finding or Global
+forward path. Finding and Global labels were retained only as supervised
+training targets and validation metrics, since removing those would no longer
+be a supervised training test.
+
+| Stage | Images | Steps | Initial loss | Final loss | Finite | GT anatomy used |
+| --- | ---: | ---: | ---: | ---: | :---: | :---: |
+| Stage 2 Finding | 8 | 2 | 0.604674 | 0.589864 | yes | no |
+| Stage 3 Global | 8 | 2 | 0.502589 | 0.127840 | yes | no |
+
+The Stage 3 report also records `roi_mode=predicted` and
+`uses_gt_anatomy_masks=false`. The generated inference/intervention artifact
+was written to `/home/user/gxq/stage3-validation/deployment-smoke`.
+
 With Stage 1/2 outputs frozen, the 5,315,345 Aggregator and Fusion parameters
 trained for 200 steps on 16 images with mixed global-label patterns.
 
