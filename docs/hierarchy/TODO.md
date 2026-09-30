@@ -40,7 +40,7 @@
 - [x] Implement masked anatomy, finding, and global losses.
 - [x] Add configurable class-imbalance handling after validity masking.
 - [ ] Train the anatomy head first with the encoders frozen.
-- [ ] Train finding recognition with GT ROI masks.
+- [x] Train/evaluate finding recognition with GT ROI and predicted ROI paths.
 - [x] Add predicted-mask teacher-forcing scheduling and checkpoint state.
 - [x] Rebuild optimizer and scheduler when switching hierarchy stages.
 - [ ] Train Stage 3, then run low-learning-rate joint fine-tuning.

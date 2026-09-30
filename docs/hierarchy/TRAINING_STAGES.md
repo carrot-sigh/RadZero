@@ -1,13 +1,14 @@
 # Hierarchy Training Stages
 
-The training controller owns parameter freezing and GT ROI scheduling. Its
+The training controller owns parameter freezing and GT-to-predicted ROI
+scheduling. Its
 `stage_index` and `step` are persistent model buffers and therefore survive
 checkpoint save/load.
 
 | Stage | Trainable modules | Expected supervision |
 | --- | --- | --- |
 | `anatomy` | `anatomy_head` | Anatomy patch masks |
-| `finding` | `finding_head` | Region-finding targets with GT ROI masks |
+| `finding` | `finding_head` | Region-finding targets with scheduled GT-to-predicted ROI masks |
 | `global` | `finding_aggregator`, `global_branch`, `evidence_fusion` | Global labels |
 | `joint` | All hierarchy modules | All available targets |
 
@@ -22,9 +23,14 @@ Set `joint_train_encoders: true` only for a deliberate joint fine-tuning run.
   when changing stages in the same process; it rebuilds optimizer and scheduler.
 - `model.set_hierarchy_training_step(step)` records the optimizer global step.
 - `model.get_teacher_forcing_ratio()` returns the current linear schedule value.
-- `gt_anatomy_masks` enables scheduled GT ROI use during training.
+- `gt_anatomy_masks` enables scheduled GT ROI teacher forcing during training;
+  the deployment-aligned endpoint is the predicted Anatomy ROI.
 - `anatomy_mask_override` remains reserved for explicit experiments and cannot
   be combined with teacher forcing.
+
+The primary Stage 2 route is `Stage 1 predicted ROI -> masked_attention`.
+`feature_roi` and `full_refiner` are explicit ablation strategies and are not
+the default production path.
 
 The trainer must set the hierarchy step from its optimizer global step, not from
 micro-batch count. After loading a training checkpoint, call

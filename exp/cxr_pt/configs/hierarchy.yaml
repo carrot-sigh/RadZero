@@ -12,6 +12,8 @@ model:
       finding_logit_temperature: 0.07
       global_logit_temperature: 0.07
       finding_chunk_size: 8
+      # Mainline: Stage 1 predicted ROI -> Stage 2 masked attention.
+      # feature_roi/full_refiner are explicit ablation strategies only.
       finding_roi_strategy: masked_attention
       feature_roi_size: 14
       feature_roi_context_margin: 0.0

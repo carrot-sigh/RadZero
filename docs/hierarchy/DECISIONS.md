@@ -43,6 +43,9 @@ rationale, and affected experiments whenever a design choice is frozen.
   temperature.
 - GT anatomy annotation availability controls only loss and metrics. All fixed
   anatomy queries remain available during train, validation, and test.
+- The deployment-aligned Stage 2 mainline is Stage 1 predicted ROI followed by
+  masked attention. Feature ROI/ROIAlign plus local refinement remains an
+  ablation because its predicted-ROI pilot was less robust and more expensive.
 
 ## Open decisions
 
@@ -62,3 +65,4 @@ rationale, and affected experiments whenever a design choice is frozen.
 | 2026-09-28 | Freeze the V1 labels and compatibility matrix from official training splits. | Prevents vocabulary drift and validation/test leakage. | Data, training, and evaluation |
 | 2026-09-29 | Separate anatomy query availability from annotation availability. | Prevents GT bbox-presence leakage into validation and test predictions. | All hierarchy stages and evaluation |
 | 2026-09-29 | Share the Stage 1 anatomy similarity map and reuse full-token RadZero for the Stage 3 global branch. | Aligns implementation with the frozen research design and preserves a faithful global reference path. | Stage 1 and Stage 3 |
+| 2026-09-30 | Use Stage 1 predicted ROI -> Stage 2 masked attention as the mainline; keep Feature ROI as an ablation. | The predicted-ROI pilot preserved Masked ROI performance, while Feature ROI degraded under localization error and added substantial compute/parameters. | Stage 2 training, validation, and deployment |

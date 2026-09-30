@@ -12,7 +12,7 @@ starting the next one.
 
 ## 2. Training-stage control
 
-- [x] Define anatomy, finding-with-GT-ROI, global, and joint training phases.
+- [x] Define anatomy, finding (GT-to-predicted ROI), global, and joint phases.
 - [x] Freeze and unfreeze modules deterministically for each phase.
 - [x] Add scheduled GT-to-predicted ROI teacher forcing.
 - [x] Save the phase and schedule state in checkpoints.
