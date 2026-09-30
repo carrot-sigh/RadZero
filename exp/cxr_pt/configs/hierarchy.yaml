@@ -33,6 +33,17 @@ model:
         teacher_forcing_end_ratio: 0.0
         teacher_forcing_start_step: 0
         teacher_forcing_end_step: 10000
+      # The four phases share the existing 20-epoch budget. Adjust these
+      # explicit values per experiment rather than relying on an implicit stage.
+      training_schedule:
+        - stage: anatomy
+          num_train_epochs: 5
+        - stage: finding
+          num_train_epochs: 5
+        - stage: global
+          num_train_epochs: 5
+        - stage: joint
+          num_train_epochs: 5
 
   module_to_update:
     - anatomy_head
@@ -46,6 +57,8 @@ model:
 
 experiment:
   name: hierarchy
+  # Required when resume_from_checkpoint points into a staged hierarchy run.
+  resume_stage: null
 
 dataset:
   hierarchy:

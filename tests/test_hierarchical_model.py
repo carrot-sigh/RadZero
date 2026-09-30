@@ -174,15 +174,34 @@ class HierarchicalModelTest(unittest.TestCase):
             ),
         )
 
-        torch.testing.assert_close(first.logits, second.logits)
+        for first_tensor, second_tensor in (
+            (first.anatomy.roi_masks, second.anatomy.roi_masks),
+            (first.finding.finding_logits, second.finding.finding_logits),
+            (first.finding.attention_weights, second.finding.attention_weights),
+            (first.finding.evidence_tokens, second.finding.evidence_tokens),
+            (
+                first.global_evidence.evidence_tokens,
+                second.global_evidence.evidence_tokens,
+            ),
+            (first.fusion.logits, second.fusion.logits),
+        ):
+            torch.testing.assert_close(first_tensor, second_tensor)
 
     def test_original_forward_and_compute_logits_are_inherited(self):
-        self.assertIs(HierarchicalCxrAlignModel.forward, CxrAlignModel.forward)
         self.assertIs(
             HierarchicalCxrAlignModel.compute_logits, CxrAlignModel.compute_logits
         )
         output = self.model(self.pixel_values, return_loss=False)
         self.assertEqual(output["vision_tokens"].shape, self.pixel_values.shape)
+
+        hierarchy_output = self.model(
+            self.pixel_values,
+            encoded_anatomy_prompts=self.encoded_anatomy,
+            encoded_finding_prompts=self.encoded_finding,
+            encoded_global_prompts=self.encoded_global,
+            return_loss=False,
+        )
+        self.assertEqual(hierarchy_output.logits.shape, (self.batch_size, self.globals))
 
     def test_prompt_count_validation_is_clear(self):
         invalid_findings = {"features": torch.randn(2, self.hidden_dim)}
@@ -193,6 +212,39 @@ class HierarchicalModelTest(unittest.TestCase):
                 invalid_findings,
                 self.encoded_global,
             )
+
+    def test_feature_api_requires_full_visual_tokens_with_cls(self):
+        patch_tokens = self.pixel_values[:, 1:]
+        anatomy_queries = self.encoded_anatomy["features"][:, self.hidden_dim :]
+        finding_queries = self.encoded_finding["features"]
+        global_queries = self.encoded_global["features"]
+
+        with self.assertRaisesRegex(ValueError, "include the CLS token"):
+            self.model.forward_hierarchy_from_features(
+                patch_tokens,
+                anatomy_queries,
+                finding_queries,
+                global_queries,
+            )
+        with self.assertRaisesRegex(ValueError, "CLS followed by all patch tokens"):
+            self.model.forward_hierarchy_from_features(
+                patch_tokens,
+                anatomy_queries,
+                finding_queries,
+                global_queries,
+                global_visual_tokens=patch_tokens,
+            )
+
+        output = self.model.forward_hierarchy_from_features(
+            patch_tokens,
+            anatomy_queries,
+            finding_queries,
+            global_queries,
+            global_visual_tokens=self.pixel_values,
+        )
+        self.assertEqual(
+            output.global_evidence.attention_weights.size(-1), self.tokens + 1
+        )
 
     def test_hierarchy_loss_is_attached_and_backpropagates(self):
         anatomy_targets = torch.randint(

@@ -1,7 +1,46 @@
 import os
+import random
 from typing import Optional
 
+import numpy as np
+import torch
+from transformers.trainer import unwrap_model
+from transformers.training_args import ParallelMode
+
 from common.trainer import BaseTrainer, get_last_checkpoint, logger
+from exp.cxr_pt.hierarchy_metrics import compute_hierarchy_trainer_metrics
+
+
+HIERARCHY_STAGE_ORDER = ("anatomy", "finding", "global", "joint")
+
+
+def validate_hierarchy_schedule(schedule):
+    """Validate an explicit, ordered Anatomy -> Finding -> Global -> Joint plan."""
+    if not isinstance(schedule, list) or len(schedule) != len(HIERARCHY_STAGE_ORDER):
+        raise ValueError(
+            "hierarchy training_schedule must define anatomy, finding, global, "
+            "and joint phases."
+        )
+    stages = tuple(phase.get("stage") for phase in schedule)
+    if stages != HIERARCHY_STAGE_ORDER:
+        raise ValueError(
+            f"hierarchy training_schedule must follow {HIERARCHY_STAGE_ORDER}, "
+            f"got {stages}."
+        )
+    normalized = []
+    for phase in schedule:
+        epochs = phase.get("num_train_epochs")
+        if (
+            not isinstance(epochs, (int, float))
+            or isinstance(epochs, bool)
+            or epochs <= 0
+        ):
+            raise ValueError(
+                f"Hierarchy phase {phase['stage']!r} requires positive "
+                "num_train_epochs."
+            )
+        normalized.append({"stage": phase["stage"], "num_train_epochs": float(epochs)})
+    return normalized
 
 
 class CXRPreTrainer(BaseTrainer):
@@ -21,6 +60,12 @@ class CXRPreTrainer(BaseTrainer):
         cfg=None,
         **kwargs,
     ):
+        if (
+            compute_metrics is None
+            and model is not None
+            and hasattr(model, "forward_hierarchy")
+        ):
+            compute_metrics = self._compute_hierarchy_metrics
         super().__init__(
             model=model,
             args=args,
@@ -36,6 +81,53 @@ class CXRPreTrainer(BaseTrainer):
             cfg=cfg,
             **kwargs,
         )
+
+    def _compute_hierarchy_metrics(self, eval_prediction):
+        controller = getattr(self.model, "training_controller", None)
+        stage = controller.stage if controller is not None else "joint"
+        return compute_hierarchy_trainer_metrics(eval_prediction, stage=stage)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        hierarchy_model = unwrap_model(model if model is not None else self.model)
+        if hasattr(hierarchy_model, "configure_hierarchy_training"):
+            modules = hierarchy_model.configure_hierarchy_training()
+            logger.info(
+                "Restored hierarchy stage %s; trainable modules: %s",
+                hierarchy_model.training_controller.stage,
+                ", ".join(modules),
+            )
+
+    def _load_rng_state(self, checkpoint):
+        """Load trusted Trainer RNG checkpoints under PyTorch 2.6+ defaults."""
+        if checkpoint is None:
+            return
+        if self.args.world_size > 1:
+            rng_file = os.path.join(
+                checkpoint, f"rng_state_{self.args.process_index}.pth"
+            )
+        else:
+            rng_file = os.path.join(checkpoint, "rng_state.pth")
+        if not os.path.isfile(rng_file):
+            logger.info(
+                "No RNG state found at %s; exact resume is not guaranteed.", rng_file
+            )
+            return
+        try:
+            checkpoint_rng_state = torch.load(rng_file, weights_only=False)
+        except TypeError:
+            checkpoint_rng_state = torch.load(rng_file)
+        random.setstate(checkpoint_rng_state["python"])
+        np.random.set_state(checkpoint_rng_state["numpy"])
+        torch.random.set_rng_state(checkpoint_rng_state["cpu"])
+        if torch.cuda.is_available() and "cuda" in checkpoint_rng_state:
+            try:
+                if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+                    torch.cuda.random.set_rng_state_all(checkpoint_rng_state["cuda"])
+                else:
+                    torch.cuda.random.set_rng_state(checkpoint_rng_state["cuda"])
+            except Exception as error:
+                logger.info("Could not restore CUDA RNG state: %s", error)
 
     def configure_hierarchy_stage(self, stage, num_training_steps):
         """Switch stages between train runs and rebuild optimization state."""
@@ -61,10 +153,11 @@ class CXRPreTrainer(BaseTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False):
         if "encoded_anatomy_prompts" in inputs:
-            if hasattr(model, "set_hierarchy_training_step"):
-                model.set_hierarchy_training_step(int(self.state.global_step))
+            hierarchy_model = unwrap_model(model)
+            if hasattr(hierarchy_model, "set_hierarchy_training_step"):
+                hierarchy_model.set_hierarchy_training_step(int(self.state.global_step))
             hierarchy_inputs = dict(inputs)
-            controller = getattr(model, "training_controller", None)
+            controller = getattr(hierarchy_model, "training_controller", None)
             stage = controller.stage if controller is not None else "joint"
             if stage == "anatomy":
                 hierarchy_inputs["finding_targets"] = None
@@ -75,16 +168,16 @@ class CXRPreTrainer(BaseTrainer):
             elif stage == "global":
                 hierarchy_inputs["anatomy_targets"] = None
                 hierarchy_inputs["finding_targets"] = None
-            hierarchy_output = model.forward_hierarchy(
+            hierarchy_output = model(
                 return_loss=True,
                 **hierarchy_inputs,
             )
             losses = dict(hierarchy_output.losses)
-            if hasattr(model, "get_teacher_forcing_ratio"):
+            if hasattr(hierarchy_model, "get_teacher_forcing_ratio"):
                 losses["teacher_forcing_ratio"] = hierarchy_output.logits.new_tensor(
-                    model.get_teacher_forcing_ratio()
+                    hierarchy_model.get_teacher_forcing_ratio()
                 )
-            controller = getattr(model, "training_controller", None)
+            controller = getattr(hierarchy_model, "training_controller", None)
             if controller is not None:
                 losses["hierarchy_stage_index"] = hierarchy_output.logits.new_tensor(
                     float(controller.stage_index.item())
@@ -101,6 +194,51 @@ class CXRPreTrainer(BaseTrainer):
         outputs["losses"] = losses
 
         return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        if "encoded_anatomy_prompts" not in inputs:
+            return super().prediction_step(
+                model, inputs, prediction_loss_only, ignore_keys=ignore_keys
+            )
+
+        inputs = self._prepare_inputs(inputs)
+        inference_inputs = dict(inputs)
+        inference_inputs.pop("gt_anatomy_masks", None)
+        controller = getattr(unwrap_model(model), "training_controller", None)
+        stage = controller.stage if controller is not None else "joint"
+        if stage == "anatomy":
+            inference_inputs["finding_targets"] = None
+            inference_inputs["global_targets"] = None
+        elif stage == "finding":
+            inference_inputs["anatomy_targets"] = None
+            inference_inputs["global_targets"] = None
+        elif stage == "global":
+            inference_inputs["anatomy_targets"] = None
+            inference_inputs["finding_targets"] = None
+
+        with torch.no_grad(), self.compute_loss_context_manager():
+            output = model(return_loss=True, **inference_inputs)
+        loss = output.losses["loss"].mean().detach()
+        losses = {key: value.mean().detach() for key, value in output.losses.items()}
+        if prediction_loss_only:
+            return loss, None, None, losses
+
+        predictions = (
+            output.anatomy.roi_masks.detach().float(),
+            output.finding.finding_logits.detach().float(),
+            output.fusion.logits.detach().float(),
+        )
+        labels = (
+            inputs["anatomy_targets"].detach(),
+            inputs["finding_targets"].detach(),
+            inputs["global_targets"].detach(),
+            inputs.get(
+                "anatomy_annotation_mask", inputs.get("anatomy_valid_mask")
+            ).detach(),
+            inputs["finding_valid_mask"].detach(),
+            inputs["global_valid_mask"].detach(),
+        )
+        return loss, predictions, labels, losses
 
     def inference_step(self, model, inputs, ignore_keys, **kwargs):
         inputs = self._prepare_inputs(inputs)

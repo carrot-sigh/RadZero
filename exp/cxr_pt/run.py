@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 from functools import partial
 
@@ -16,7 +17,68 @@ from exp.cxr_pt.hierarchy_dataset import (
 )
 from exp.cxr_pt.inference.inference import Inference
 from exp.cxr_pt.model import load_model
-from exp.cxr_pt.trainer import CXRPreTrainer
+from exp.cxr_pt.trainer import CXRPreTrainer, validate_hierarchy_schedule
+
+
+def _build_trainer(models, training_args, dataset, data_collator, cfg):
+    return CXRPreTrainer(
+        model=models["model"],
+        args=training_args,
+        train_dataset=dataset.get("train"),
+        eval_dataset=dataset.get("eval"),
+        data_collator=data_collator,
+        cfg=cfg,
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=cfg["experiment"]["early_stopping_patience"]
+            )
+        ],
+        tokenizer=models["tokenizer"],
+    )
+
+
+def _run_hierarchy_schedule(models, dataset, data_collator, cfg, deepspeed):
+    hierarchy_config = cfg["model"]["model_config"]["hierarchy_config"]
+    schedule = validate_hierarchy_schedule(hierarchy_config.get("training_schedule"))
+    resume_checkpoint = cfg["experiment"].get("resume_from_checkpoint")
+    resume_stage = cfg["experiment"].get("resume_stage")
+    if resume_checkpoint and resume_stage not in {phase["stage"] for phase in schedule}:
+        raise ValueError(
+            "experiment.resume_stage must name the hierarchy phase for the resume "
+            "checkpoint."
+        )
+    start_index = 0
+    if resume_checkpoint:
+        start_index = next(
+            index
+            for index, phase in enumerate(schedule)
+            if phase["stage"] == resume_stage
+        )
+
+    trainer = None
+    root_output_dir = cfg["train"]["output_dir"]
+    for phase_index, phase in enumerate(schedule[start_index:], start=start_index):
+        stage = phase["stage"]
+        models["model"].configure_hierarchy_training(stage)
+        phase_train_config = copy.deepcopy(cfg["train"])
+        phase_train_config["output_dir"] = os.path.join(root_output_dir, stage)
+        phase_train_config["num_train_epochs"] = phase["num_train_epochs"]
+        phase_train_config["max_steps"] = -1
+        training_args = TrainingArguments(
+            **phase_train_config,
+            deepspeed=copy.deepcopy(deepspeed),
+        )
+        trainer = _build_trainer(models, training_args, dataset, data_collator, cfg)
+        phase_resume = resume_checkpoint if phase_index == start_index else None
+        logger.info(
+            "Run hierarchy phase %s for %s epochs; output: %s",
+            stage,
+            phase["num_train_epochs"],
+            phase_train_config["output_dir"],
+        )
+        trainer.train(resume_from_checkpoint=phase_resume)
+        resume_checkpoint = None
+    return trainer
 
 
 def parse_args():
@@ -90,7 +152,6 @@ def main():
 
     deepspeed = dict(cfg["deepspeed"]) if cfg.get("deepspeed") else None
 
-    training_args = TrainingArguments(**cfg["train"], deepspeed=deepspeed)
     models = load_model(cfg["model"], output_dir=cfg["train"]["output_dir"])
 
     is_hierarchy = cfg["model"].get("model_class_name") == "HierarchicalCxrAlignModel"
@@ -130,26 +191,23 @@ def main():
             image_processor=models["image_processor"],
         )
 
-    trainer = CXRPreTrainer(
-        model=models["model"],
-        args=training_args,
-        train_dataset=dataset.get("train"),
-        eval_dataset=dataset.get("eval"),
-        data_collator=data_collator,
-        cfg=cfg,
-        callbacks=[
-            EarlyStoppingCallback(
-                early_stopping_patience=cfg["experiment"]["early_stopping_patience"]
-            )
-        ],
-        tokenizer=models["tokenizer"],
-    )
-
+    trainer = None
     if cfg["args"]["train"]:
         logger.info("run train")
-        trainer.train(
-            resume_from_checkpoint=cfg["experiment"]["resume_from_checkpoint"]
-        )
+        if is_hierarchy:
+            trainer = _run_hierarchy_schedule(
+                models, dataset, data_collator, cfg, deepspeed
+            )
+        else:
+            training_args = TrainingArguments(**cfg["train"], deepspeed=deepspeed)
+            trainer = _build_trainer(models, training_args, dataset, data_collator, cfg)
+            trainer.train(
+                resume_from_checkpoint=cfg["experiment"]["resume_from_checkpoint"]
+            )
+
+    if trainer is None:
+        training_args = TrainingArguments(**cfg["train"], deepspeed=deepspeed)
+        trainer = _build_trainer(models, training_args, dataset, data_collator, cfg)
 
     if cfg["args"]["inference"]:
 

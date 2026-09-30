@@ -11,6 +11,7 @@ Interpretation project built on RadZero.
 - [LABEL_CONTRACT.md](LABEL_CONTRACT.md): target shapes and unknown-label rules.
 - [TRAINING_STAGES.md](TRAINING_STAGES.md): stage ownership and teacher forcing.
 - [DATA_AUDIT.md](DATA_AUDIT.md): available inputs and current data blockers.
+- [STAGE1_READINESS.md](STAGE1_READINESS.md): real-data preflight results.
 - `exp/cxr_pt/hierarchy_contract.py`: reproducible label-contract builder.
 - `exp/cxr_pt/hierarchy_dataset.py`: manifest builder, dataset, and collator.
 - `exp/cxr_pt/hierarchy_metrics.py`: validity-aware hierarchy metrics.

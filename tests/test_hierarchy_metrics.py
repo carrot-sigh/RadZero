@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from exp.cxr_pt.hierarchy_metrics import (
     anatomy_iou_dice,
+    compute_hierarchy_trainer_metrics,
     export_hierarchy_output,
     evaluate_hierarchy_loader,
     evaluate_hierarchy_output,
@@ -101,6 +102,76 @@ class HierarchyMetricsTest(unittest.TestCase):
         self.assertAlmostEqual(output["auroc"], 1.0)
         self.assertAlmostEqual(output["auprc"], 1.0)
         self.assertAlmostEqual(output["f1"], 1.0)
+
+    def test_finding_metrics_use_only_valid_anatomy_finding_pairs(self):
+        logits = torch.tensor(
+            [
+                [[8.0, -8.0], [-100.0, 100.0]],
+                [[-8.0, 8.0], [100.0, -100.0]],
+            ]
+        )
+        targets = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 0.0]],
+                [[0.0, 1.0], [0.0, 0.0]],
+            ]
+        )
+        valid = torch.tensor(
+            [
+                [[True, True], [False, False]],
+                [[True, True], [False, False]],
+            ]
+        )
+        output = SimpleNamespace(
+            finding=SimpleNamespace(finding_logits=logits),
+        )
+
+        metrics = evaluate_hierarchy_output(
+            output,
+            finding_targets=targets,
+            finding_valid_mask=valid,
+        )
+
+        self.assertEqual(metrics["finding_f1"], 1.0)
+        self.assertEqual(metrics["finding_auroc"], 1.0)
+        self.assertEqual(metrics["finding_auprc"], 1.0)
+        self.assertEqual(metrics["finding_auroc_class_0"], 1.0)
+        self.assertEqual(metrics["finding_auprc_class_0"], 1.0)
+        self.assertEqual(metrics["finding_auroc_class_1"], 1.0)
+        self.assertEqual(metrics["finding_auprc_class_1"], 1.0)
+
+    def test_finding_metrics_omit_curve_values_without_both_classes(self):
+        output = SimpleNamespace(
+            finding=SimpleNamespace(finding_logits=torch.tensor([[[8.0]], [[7.0]]]))
+        )
+        metrics = evaluate_hierarchy_output(
+            output,
+            finding_targets=torch.ones(2, 1, 1),
+            finding_valid_mask=torch.ones(2, 1, 1, dtype=torch.bool),
+        )
+
+        self.assertNotIn("finding_auroc_class_0", metrics)
+        self.assertNotIn("finding_auprc_class_0", metrics)
+
+    def test_trainer_metric_adapter_excludes_unannotated_anatomy(self):
+        predictions = (
+            torch.tensor([[[0.9, 0.1, 0.1, 0.1], [1.0, 1.0, 1.0, 1.0]]]),
+            torch.tensor([[[2.0], [2.0]]]),
+            torch.tensor([[2.0]]),
+        )
+        labels = (
+            torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]]),
+            torch.ones(1, 2, 1),
+            torch.ones(1, 1),
+            torch.tensor([[True, False]]),
+            torch.ones(1, 2, 1, dtype=torch.bool),
+            torch.ones(1, 1, dtype=torch.bool),
+        )
+        metrics = compute_hierarchy_trainer_metrics(
+            SimpleNamespace(predictions=predictions, label_ids=labels)
+        )
+        self.assertEqual(metrics["anatomy_dice"], 1.0)
+        self.assertEqual(metrics["anatomy_iou"], 1.0)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@
 ## P4 - Evaluation
 
 - [x] Add anatomy IoU, Dice, and pointing-game metrics.
+- [x] Integrate validity-aware anatomy metrics into Trainer validation.
 - [x] Add validity-aware finding/global AUROC/AUPRC metrics.
 - [x] Add validity-aware 14-label F1 metrics.
 - [ ] Compare GT, predicted, shuffled, and full-image ROI masks.
@@ -57,7 +58,7 @@
 
 ## P5 - Verification
 
-- [ ] Test bbox transforms and left/right semantics.
+- [x] Test bbox transforms and left/right semantics on four real 518x518 overlays.
 - [x] Test masked softmax and empty ROIs for finite outputs.
 - [x] Test that unknown labels do not contribute to losses.
 - [x] Test Stage 1 -> Stage 2 -> Stage 3 tensor contracts.
@@ -66,3 +67,6 @@
 - [x] Add a regression test for original RadZero logits and inference shapes.
 - [x] Test that GT anatomy annotation presence cannot change inference outputs.
 - [x] Test bounded temperatures under extreme log-temperature values.
+- [x] Test full Trainer checkpoint resume (model, optimizer, scheduler, step, stage, RNG).
+- [x] Test the formal hierarchy config loads RadZero and builds the Stage 1 optimizer.
+- [x] Run a real single-image Stage 1 overfit with Dice/IoU and ROI visualizations.

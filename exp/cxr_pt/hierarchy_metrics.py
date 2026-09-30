@@ -31,7 +31,9 @@ def pointing_game(attention, targets, valid_mask=None):
     return {"pointing_accuracy": _masked_mean(hit.float(), has_valid)}
 
 
-def multilabel_metrics(scores, targets, valid_mask=None, threshold=0.5):
+def multilabel_metrics(
+    scores, targets, valid_mask=None, threshold=0.5, include_per_class=False
+):
     scores, targets, valid_mask = _classification_arrays(scores, targets, valid_mask)
     output = OrderedDict()
     predictions = (scores >= threshold).astype(np.int64)
@@ -40,6 +42,17 @@ def multilabel_metrics(scores, targets, valid_mask=None, threshold=0.5):
     output["auprc"] = _macro_curve_metric(
         average_precision_score, scores, targets, valid_mask
     )
+    if include_per_class:
+        for index in range(targets.shape[1]):
+            mask = valid_mask[:, index]
+            if mask.sum() == 0 or np.unique(targets[mask, index]).size < 2:
+                continue
+            output[f"auroc_class_{index}"] = float(
+                roc_auc_score(targets[mask, index], scores[mask, index])
+            )
+            output[f"auprc_class_{index}"] = float(
+                average_precision_score(targets[mask, index], scores[mask, index])
+            )
     return output
 
 
@@ -154,20 +167,27 @@ def evaluate_hierarchy_output(
             }
         )
     if finding_targets is not None:
-        finding_scores = torch.sigmoid(output.finding.finding_logits).mean(dim=1)
-        finding_targets_flat = finding_targets.any(dim=1).float()
-        finding_valid = (
-            finding_valid_mask.any(dim=1) if finding_valid_mask is not None else None
-        )
-        if finding_scores.shape != finding_targets_flat.shape:
+        finding_logits = output.finding.finding_logits
+        if finding_logits.shape != finding_targets.shape or finding_logits.dim() != 3:
             raise ValueError(
-                "finding output and targets must agree after anatomy aggregation."
+                "finding logits and targets must both have shape [B, A, F]."
             )
+        finding_count = finding_logits.size(-1)
+        finding_scores = torch.sigmoid(finding_logits).reshape(-1, finding_count)
+        finding_targets_flat = finding_targets.reshape(-1, finding_count)
+        finding_valid = None
+        if finding_valid_mask is not None:
+            if finding_valid_mask.shape != finding_targets.shape:
+                raise ValueError("finding_valid_mask must match finding targets.")
+            finding_valid = finding_valid_mask.reshape(-1, finding_count)
         metrics.update(
             {
                 f"finding_{key}": value
                 for key, value in multilabel_metrics(
-                    finding_scores, finding_targets_flat, finding_valid
+                    finding_scores,
+                    finding_targets_flat,
+                    finding_valid,
+                    include_per_class=True,
                 ).items()
             }
         )
@@ -182,6 +202,44 @@ def evaluate_hierarchy_output(
             }
         )
     return metrics
+
+
+def compute_hierarchy_trainer_metrics(eval_prediction, stage="joint"):
+    """Adapt hierarchy prediction tuples to the Transformers Trainer API."""
+    if stage not in {"anatomy", "finding", "global", "joint"}:
+        raise ValueError(f"Unsupported hierarchy evaluation stage: {stage}")
+    anatomy_predictions, finding_predictions, global_predictions = (
+        torch.as_tensor(value) for value in eval_prediction.predictions
+    )
+    (
+        anatomy_targets,
+        finding_targets,
+        global_targets,
+        anatomy_valid,
+        finding_valid,
+        global_valid,
+    ) = (torch.as_tensor(value) for value in eval_prediction.label_ids)
+
+    class Output:
+        pass
+
+    output = Output()
+    output.anatomy = type("Anatomy", (), {"roi_masks": anatomy_predictions})
+    output.finding = type("Finding", (), {"finding_logits": finding_predictions})
+    output.fusion = type("Fusion", (), {"logits": global_predictions})
+    metrics = evaluate_hierarchy_output(
+        output,
+        anatomy_targets=anatomy_targets,
+        finding_targets=(
+            finding_targets if stage in {"finding", "global", "joint"} else None
+        ),
+        global_targets=global_targets if stage in {"global", "joint"} else None,
+        anatomy_valid_mask=anatomy_valid.bool(),
+        finding_valid_mask=finding_valid.bool(),
+        global_valid_mask=global_valid.bool(),
+        grid_shape=_infer_grid_shape(anatomy_targets),
+    )
+    return {key: _metric_value(value) for key, value in metrics.items()}
 
 
 def export_hierarchy_output(output):

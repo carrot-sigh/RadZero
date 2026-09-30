@@ -95,6 +95,12 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         self.hierarchy_loss = HierarchyLoss(**loss_config)
         self.training_controller = HierarchyTrainingController(**training_config)
 
+    def forward(self, pixel_values, *args, **kwargs):
+        """Route hierarchy batches through the standard parallel-model entry point."""
+        if "encoded_anatomy_prompts" in kwargs:
+            return self.forward_hierarchy(pixel_values, *args, **kwargs)
+        return super().forward(pixel_values, *args, **kwargs)
+
     def forward_hierarchy(
         self,
         pixel_values,
@@ -182,6 +188,22 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         return_loss=False,
     ):
         self._validate_feature_counts(anatomy_queries, finding_queries, global_queries)
+        if global_visual_tokens is None:
+            raise ValueError(
+                "global_visual_tokens is required and must include the CLS token."
+            )
+        if (
+            global_visual_tokens.dim() != 3
+            or global_visual_tokens.size(0) != visual_tokens.size(0)
+            or global_visual_tokens.size(2) != visual_tokens.size(2)
+        ):
+            raise ValueError(
+                "global_visual_tokens must match visual_tokens batch and hidden dimensions."
+            )
+        if global_visual_tokens.size(1) != visual_tokens.size(1) + 1:
+            raise ValueError(
+                "global_visual_tokens must contain CLS followed by all patch tokens."
+            )
         anatomy = self.anatomy_head(
             anatomy_queries,
             visual_tokens,
@@ -206,11 +228,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         global_queries_for_branch, global_visual_tokens = (
             self._prepare_radzero_global_inputs(
                 global_queries,
-                (
-                    global_visual_tokens
-                    if global_visual_tokens is not None
-                    else visual_tokens
-                ),
+                global_visual_tokens,
             )
         )
         finding_aggregation = self.finding_aggregator(

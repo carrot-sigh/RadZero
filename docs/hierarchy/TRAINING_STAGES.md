@@ -34,3 +34,15 @@ stored in the checkpoint buffer.
 Do not call the model-level stage setter after optimizer creation. Newly
 unfrozen parameters are not automatically added to an existing optimizer.
 Frozen vision, text, and alignment encoders remain in eval mode during training.
+
+## Formal schedule
+
+The hierarchy entry point requires an explicit `training_schedule` in
+`hierarchy_config`. It runs `anatomy`, `finding`, `global`, and `joint` in that
+order. Every phase gets a fresh Trainer, optimizer, scheduler, and output
+directory named after the stage. With `load_best_model_at_end`, the selected
+phase checkpoint remains in memory as the starting model for the next phase.
+
+To resume a staged run, set both `experiment.resume_from_checkpoint` and
+`experiment.resume_stage`. Earlier phases are skipped and later phases continue
+normally after the resumed phase completes.

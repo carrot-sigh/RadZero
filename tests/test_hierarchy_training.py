@@ -102,6 +102,7 @@ class HierarchyTrainingControllerTest(unittest.TestCase):
             anatomy_queries,
             finding_queries,
             global_queries,
+            global_visual_tokens=torch.randn(batch_size, tokens + 1, hidden_dim),
             gt_anatomy_masks=ground_truth,
             teacher_forcing_ratio=1.0,
         )
@@ -110,6 +111,7 @@ class HierarchyTrainingControllerTest(unittest.TestCase):
             anatomy_queries,
             finding_queries,
             global_queries,
+            global_visual_tokens=torch.randn(batch_size, tokens + 1, hidden_dim),
             gt_anatomy_masks=ground_truth,
             teacher_forcing_ratio=0.0,
         )
@@ -128,6 +130,7 @@ class HierarchyTrainingControllerTest(unittest.TestCase):
                 torch.randn(3, 8),
                 torch.randn(4, 8),
                 torch.randn(5, 8),
+                global_visual_tokens=torch.randn(2, 8, 8),
                 anatomy_mask_override=masks,
                 gt_anatomy_masks=masks,
             )
