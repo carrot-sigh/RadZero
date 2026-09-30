@@ -11,10 +11,7 @@ from common.code_snapshot import code_snapshot
 from common.trainer import logger
 from common.utils import Config, output_directory_setting, str2bool
 from exp.cxr_pt.dataset import collate_fn, load_datasets
-from exp.cxr_pt.hierarchy_dataset import (
-    HierarchyJsonlDataset,
-    hierarchy_collate_fn,
-)
+from exp.cxr_pt.hierarchy_dataset import HierarchyJsonlDataset, hierarchy_collate_fn
 from exp.cxr_pt.inference.inference import Inference
 from exp.cxr_pt.model import load_model
 from exp.cxr_pt.trainer import CXRPreTrainer, validate_hierarchy_schedule
@@ -216,6 +213,16 @@ def main():
             checkpoint = trainer.state.best_model_checkpoint
         else:
             checkpoint = cfg["experiment"]["resume_from_checkpoint"]
+
+        if is_hierarchy:
+            trainer.inference(
+                test_dataset=dataset["eval"],
+                output_dir=os.path.join(
+                    cfg["train"]["output_dir"], "inference", "hierarchy"
+                ),
+                resume_from_checkpoint=checkpoint,
+            )
+            return
 
         resume_from_checkpoint = trainer.inference_load_from_checkpoint(
             resume_from_checkpoint=checkpoint

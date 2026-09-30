@@ -227,17 +227,24 @@ def compute_hierarchy_trainer_metrics(eval_prediction, stage="joint"):
     output.anatomy = type("Anatomy", (), {"roi_masks": anatomy_predictions})
     output.finding = type("Finding", (), {"finding_logits": finding_predictions})
     output.fusion = type("Fusion", (), {"logits": global_predictions})
+    has_anatomy = bool(anatomy_valid.any())
+    has_finding = bool(finding_valid.any())
+    has_global = bool(global_valid.any())
     metrics = evaluate_hierarchy_output(
         output,
-        anatomy_targets=anatomy_targets,
+        anatomy_targets=anatomy_targets if has_anatomy else None,
         finding_targets=(
-            finding_targets if stage in {"finding", "global", "joint"} else None
+            finding_targets
+            if has_finding and stage in {"finding", "global", "joint"}
+            else None
         ),
-        global_targets=global_targets if stage in {"global", "joint"} else None,
+        global_targets=(
+            global_targets if has_global and stage in {"global", "joint"} else None
+        ),
         anatomy_valid_mask=anatomy_valid.bool(),
         finding_valid_mask=finding_valid.bool(),
         global_valid_mask=global_valid.bool(),
-        grid_shape=_infer_grid_shape(anatomy_targets),
+        grid_shape=_infer_grid_shape(anatomy_targets) if has_anatomy else None,
     )
     return {key: _metric_value(value) for key, value in metrics.items()}
 

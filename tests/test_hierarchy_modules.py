@@ -1,6 +1,7 @@
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from exp.cxr_pt.model.hierarchy import (
     AnatomyGroundingHead,
@@ -144,6 +145,97 @@ class HierarchyModulesTest(unittest.TestCase):
             torch.ones(int(full.pair_mask.sum())),
         )
 
+    def test_finding_head_matches_manual_roi_attention_and_logits(self):
+        head = AnatomyMaskedFindingHead(
+            hidden_dim=2,
+            num_findings=2,
+            attention_temperature=0.5,
+            logit_temperature=0.25,
+        )
+        with torch.no_grad():
+            head.finding_bias.copy_(torch.tensor([0.3, -0.2]))
+        queries = torch.tensor([[1.0, 1.0], [1.0, -1.0]])
+        tokens = torch.tensor([[[2.0, 0.0], [0.0, 3.0], [1.0, 1.0]]])
+        roi = torch.tensor([[[1.0, 0.0, 0.5], [0.0, 1.0, 1.0]]])
+        compatibility = torch.tensor([[True, False], [True, True]])
+
+        output = head(queries, tokens, roi, compatibility_mask=compatibility)
+
+        normalized_queries = F.normalize(queries, dim=-1)
+        normalized_tokens = F.normalize(tokens, dim=-1)
+        base_similarity = (
+            torch.einsum("fd,bld->bfl", normalized_queries, normalized_tokens) / 0.5
+        )
+        expanded_similarity = base_similarity[:, None].expand(-1, 2, -1, -1)
+        log_roi = torch.log(roi.clamp_min(torch.finfo(roi.dtype).tiny))
+        manual_masked = expanded_similarity + log_roi[:, :, None]
+        manual_masked = manual_masked.masked_fill(
+            roi[:, :, None] == 0, torch.finfo(roi.dtype).min
+        )
+        manual_attention = torch.softmax(manual_masked, dim=-1)
+        manual_evidence = torch.einsum(
+            "bafl,bld->bafd", manual_attention, normalized_tokens
+        )
+        manual_matching = F.cosine_similarity(
+            manual_evidence,
+            normalized_queries[None, None],
+            dim=-1,
+        )
+        manual_logits = manual_matching / 0.25 + head.finding_bias[None, None]
+        pair_mask = compatibility[None]
+
+        torch.testing.assert_close(
+            output.similarity_scores[pair_mask],
+            expanded_similarity[pair_mask],
+        )
+        torch.testing.assert_close(
+            output.masked_similarity_scores[pair_mask],
+            manual_masked[pair_mask],
+        )
+        torch.testing.assert_close(
+            output.attention_weights[pair_mask],
+            manual_attention[pair_mask],
+        )
+        torch.testing.assert_close(
+            output.evidence_tokens[pair_mask], manual_evidence[pair_mask]
+        )
+        torch.testing.assert_close(
+            output.matching_scores[pair_mask], manual_matching[pair_mask]
+        )
+        torch.testing.assert_close(
+            output.finding_logits[pair_mask], manual_logits[pair_mask]
+        )
+        self.assertTrue(torch.all(output.attention_weights[~pair_mask] == 0))
+        self.assertTrue(torch.all(output.evidence_tokens[~pair_mask] == 0))
+        self.assertTrue(torch.all(output.finding_logits[~pair_mask] == 0))
+
+    def test_finding_roi_intervention_is_batch_and_anatomy_local(self):
+        head = AnatomyMaskedFindingHead(self.hidden_dim, self.finding_count)
+        first_roi = torch.ones(self.batch_size, self.anatomy_count, self.token_count)
+        second_roi = first_roi.clone()
+        second_roi[0, 1] = 0
+        second_roi[0, 1, -1] = 1
+
+        first = head(self.finding_queries, self.visual_tokens, first_roi)
+        second = head(self.finding_queries, self.visual_tokens, second_roi)
+
+        self.assertFalse(
+            torch.equal(first.attention_weights[0, 1], second.attention_weights[0, 1])
+        )
+        self.assertFalse(
+            torch.equal(first.evidence_tokens[0, 1], second.evidence_tokens[0, 1])
+        )
+        torch.testing.assert_close(
+            first.attention_weights[0, 0], second.attention_weights[0, 0]
+        )
+        torch.testing.assert_close(
+            first.evidence_tokens[0, 0], second.evidence_tokens[0, 0]
+        )
+        torch.testing.assert_close(
+            first.attention_weights[1], second.attention_weights[1]
+        )
+        torch.testing.assert_close(first.evidence_tokens[1], second.evidence_tokens[1])
+
     def test_aggregator_uses_null_evidence_when_no_pairs_are_valid(self):
         aggregator = FindingEvidenceAggregator(self.hidden_dim, num_heads=2)
         evidence = torch.randn(
@@ -183,6 +275,49 @@ class HierarchyModulesTest(unittest.TestCase):
         )
         self.assertTrue(torch.all(output.attention_weights[1, :, 0, 0] == 0))
 
+    def test_aggregator_ignores_invalid_evidence_and_extreme_logits(self):
+        aggregator = FindingEvidenceAggregator(self.hidden_dim, num_heads=2)
+        evidence = torch.randn(1, 2, 2, self.hidden_dim)
+        scores = torch.randn(1, 2, 2)
+        pair_mask = torch.tensor([[[True, False], [True, False]]])
+        reference = aggregator(
+            self.global_queries,
+            evidence,
+            finding_scores=scores,
+            pair_mask=pair_mask,
+        )
+        intervened_evidence = evidence.clone()
+        intervened_scores = scores.clone()
+        intervened_evidence[~pair_mask] = 1e6
+        intervened_scores[~pair_mask] = 1e6
+        intervened = aggregator(
+            self.global_queries,
+            intervened_evidence,
+            finding_scores=intervened_scores,
+            pair_mask=pair_mask,
+        )
+
+        torch.testing.assert_close(
+            reference.evidence_tokens, intervened.evidence_tokens, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            reference.attention_weights,
+            intervened.attention_weights,
+            rtol=0,
+            atol=0,
+        )
+        changed_scores = scores.clone()
+        changed_scores[0, 0, 0] += 10
+        changed = aggregator(
+            self.global_queries,
+            evidence,
+            finding_scores=changed_scores,
+            pair_mask=pair_mask,
+        )
+        self.assertFalse(
+            torch.equal(reference.attention_weights, changed.attention_weights)
+        )
+
     def test_global_branch_and_fusion_respect_query_mask(self):
         global_branch = GlobalEvidenceBranch(self.hidden_dim)
         fusion = GatedEvidenceFusion(self.hidden_dim, self.global_count)
@@ -213,6 +348,37 @@ class HierarchyModulesTest(unittest.TestCase):
             fused.gates[valid_mask],
             torch.full((int(valid_mask.sum()), 1), 0.5),
         )
+
+    def test_fusion_matches_formula_and_forced_gate_endpoints(self):
+        fusion = GatedEvidenceFusion(
+            self.hidden_dim, self.global_count, logit_temperature=0.2
+        )
+        finding = torch.randn(self.batch_size, self.global_count, self.hidden_dim)
+        global_evidence = torch.randn_like(finding)
+        queries = torch.randn_like(finding)
+        with torch.no_grad():
+            fusion.label_bias.copy_(torch.linspace(-0.2, 0.2, self.global_count))
+
+        for gate_bias, use_finding in ((100.0, True), (-100.0, False)):
+            with torch.no_grad():
+                fusion.gate[-1].weight.zero_()
+                fusion.gate[-1].bias.fill_(gate_bias)
+            output = fusion(finding, global_evidence, queries)
+            projected_finding = fusion.finding_projection(finding)
+            projected_global = fusion.global_projection(global_evidence)
+            expected_evidence = projected_finding if use_finding else projected_global
+            expected_logits = (
+                F.cosine_similarity(expected_evidence, queries, dim=-1) / 0.2
+                + fusion.label_bias[None]
+            )
+
+            torch.testing.assert_close(output.fused_evidence, expected_evidence)
+            torch.testing.assert_close(output.logits, expected_logits)
+            expected_gate = 1.0 if use_finding else 0.0
+            torch.testing.assert_close(
+                output.gates,
+                torch.full_like(output.gates, expected_gate),
+            )
 
     def test_extreme_log_temperatures_are_bounded_and_finite(self):
         anatomy = AnatomyGroundingHead(self.hidden_dim)

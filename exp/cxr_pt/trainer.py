@@ -1,3 +1,4 @@
+import json
 import os
 import random
 from typing import Optional
@@ -8,8 +9,10 @@ from transformers.trainer import unwrap_model
 from transformers.training_args import ParallelMode
 
 from common.trainer import BaseTrainer, get_last_checkpoint, logger
-from exp.cxr_pt.hierarchy_metrics import compute_hierarchy_trainer_metrics
-
+from exp.cxr_pt.hierarchy_metrics import (
+    compute_hierarchy_trainer_metrics,
+    export_hierarchy_output,
+)
 
 HIERARCHY_STAGE_ORDER = ("anatomy", "finding", "global", "joint")
 
@@ -206,20 +209,27 @@ class CXRPreTrainer(BaseTrainer):
         inference_inputs.pop("gt_anatomy_masks", None)
         controller = getattr(unwrap_model(model), "training_controller", None)
         stage = controller.stage if controller is not None else "joint"
-        if stage == "anatomy":
-            inference_inputs["finding_targets"] = None
-            inference_inputs["global_targets"] = None
-        elif stage == "finding":
-            inference_inputs["anatomy_targets"] = None
-            inference_inputs["global_targets"] = None
-        elif stage == "global":
-            inference_inputs["anatomy_targets"] = None
-            inference_inputs["finding_targets"] = None
+        supervision = self._hierarchy_supervision(inputs)
+        stage_tasks = {
+            "anatomy": {"anatomy"},
+            "finding": {"finding"},
+            "global": {"global"},
+            "joint": {"anatomy", "finding", "global"},
+        }[stage]
+        for task in ("anatomy", "finding", "global"):
+            if task not in stage_tasks or not supervision[task]:
+                inference_inputs[f"{task}_targets"] = None
+        return_loss = any(supervision[task] for task in stage_tasks)
 
         with torch.no_grad(), self.compute_loss_context_manager():
-            output = model(return_loss=True, **inference_inputs)
-        loss = output.losses["loss"].mean().detach()
-        losses = {key: value.mean().detach() for key, value in output.losses.items()}
+            output = model(return_loss=return_loss, **inference_inputs)
+        loss = None
+        losses = {}
+        if return_loss:
+            loss = output.losses["loss"].mean().detach()
+            losses = {
+                key: value.mean().detach() for key, value in output.losses.items()
+            }
         if prediction_loss_only:
             return loss, None, None, losses
 
@@ -228,30 +238,103 @@ class CXRPreTrainer(BaseTrainer):
             output.finding.finding_logits.detach().float(),
             output.fusion.logits.detach().float(),
         )
+        if not any(supervision.values()):
+            return loss, predictions, None, losses
+
+        anatomy_valid = inputs.get(
+            "anatomy_annotation_mask", inputs.get("anatomy_valid_mask")
+        )
         labels = (
-            inputs["anatomy_targets"].detach(),
-            inputs["finding_targets"].detach(),
-            inputs["global_targets"].detach(),
-            inputs.get(
-                "anatomy_annotation_mask", inputs.get("anatomy_valid_mask")
-            ).detach(),
-            inputs["finding_valid_mask"].detach(),
-            inputs["global_valid_mask"].detach(),
+            (
+                inputs["anatomy_targets"].detach()
+                if supervision["anatomy"]
+                else torch.zeros_like(output.anatomy.roi_masks)
+            ),
+            (
+                inputs["finding_targets"].detach()
+                if supervision["finding"]
+                else torch.zeros_like(output.finding.finding_logits)
+            ),
+            (
+                inputs["global_targets"].detach()
+                if supervision["global"]
+                else torch.zeros_like(output.fusion.logits)
+            ),
+            (
+                anatomy_valid.detach()
+                if supervision["anatomy"]
+                else torch.zeros(
+                    output.anatomy.roi_masks.shape[:2],
+                    dtype=torch.bool,
+                    device=output.anatomy.roi_masks.device,
+                )
+            ),
+            (
+                inputs["finding_valid_mask"].detach()
+                if supervision["finding"]
+                else torch.zeros_like(output.finding.finding_logits, dtype=torch.bool)
+            ),
+            (
+                inputs["global_valid_mask"].detach()
+                if supervision["global"]
+                else torch.zeros_like(output.fusion.logits, dtype=torch.bool)
+            ),
         )
         return loss, predictions, labels, losses
+
+    @staticmethod
+    def _hierarchy_supervision(inputs):
+        anatomy_valid = inputs.get(
+            "anatomy_annotation_mask", inputs.get("anatomy_valid_mask")
+        )
+        return {
+            "anatomy": inputs.get("anatomy_targets") is not None
+            and anatomy_valid is not None,
+            "finding": inputs.get("finding_targets") is not None
+            and inputs.get("finding_valid_mask") is not None,
+            "global": inputs.get("global_targets") is not None
+            and inputs.get("global_valid_mask") is not None,
+        }
 
     def inference_step(self, model, inputs, ignore_keys, **kwargs):
         inputs = self._prepare_inputs(inputs)
         if ignore_keys is None:
-            if hasattr(self.model, "config"):
+            hierarchy_model = unwrap_model(model)
+            if hasattr(hierarchy_model, "config"):
                 ignore_keys = getattr(
-                    self.model.config, "keys_to_ignore_at_inference", []
+                    hierarchy_model.config, "keys_to_ignore_at_inference", []
                 )
             else:
                 ignore_keys = []
-        outputs = {}
+        if "encoded_anatomy_prompts" not in inputs:
+            return {}
 
-        # TODO: implement inference code
+        inference_inputs = dict(inputs)
+        for key in (
+            "gt_anatomy_masks",
+            "anatomy_targets",
+            "finding_targets",
+            "global_targets",
+            "anatomy_annotation_mask",
+            "anatomy_valid_mask",
+            "finding_valid_mask",
+            "global_valid_mask",
+        ):
+            inference_inputs.pop(key, None)
+        with torch.no_grad(), self.compute_loss_context_manager():
+            output = model(return_loss=False, **inference_inputs)
+        outputs = export_hierarchy_output(output)
+        outputs.update(
+            {
+                "anatomy_roi_logits": output.anatomy.roi_mask_logits.detach(),
+                "finding_evidence": output.finding.evidence_tokens.detach(),
+                "finding_matching_scores": output.finding.matching_scores.detach(),
+                "aggregated_finding_evidence": (
+                    output.finding_aggregation.evidence_tokens.detach()
+                ),
+                "global_evidence": output.global_evidence.evidence_tokens.detach(),
+            }
+        )
 
         # remove outputs to ignore
         for k in ignore_keys:
@@ -270,13 +353,32 @@ class CXRPreTrainer(BaseTrainer):
         if output_dir is None:
             output_dir = os.path.join(self.args.output_dir, "inference")
         os.makedirs(output_dir, exist_ok=True)
-        # save_path = os.path.join(output_dir, f"{checkpoint_name}.json")
-
-        results = {}
-
-        # TODO: save outputs
-
-        return results
+        checkpoint_name = checkpoint_name or f"checkpoint-{self.state.global_step}"
+        arrays = {
+            name: value
+            for name, value in outputs.predictions.items()
+            if value is not None
+        }
+        tensor_path = os.path.join(output_dir, f"{checkpoint_name}-hierarchy.npz")
+        manifest_path = os.path.join(output_dir, f"{checkpoint_name}-hierarchy.json")
+        np.savez_compressed(tensor_path, **arrays)
+        manifest = {
+            "checkpoint": checkpoint_name,
+            "num_samples": outputs.num_samples,
+            "tensor_file": os.path.basename(tensor_path),
+            "outputs": {
+                name: {"shape": list(value.shape), "dtype": str(value.dtype)}
+                for name, value in arrays.items()
+            },
+            "metrics": outputs.metrics,
+        }
+        with open(manifest_path, "w", encoding="utf-8") as destination:
+            json.dump(manifest, destination, indent=2)
+        return {
+            "tensor_path": tensor_path,
+            "manifest_path": manifest_path,
+            "manifest": manifest,
+        }
 
     def inference_load_from_checkpoint(self, resume_from_checkpoint=None):
 

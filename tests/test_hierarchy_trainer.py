@@ -1,9 +1,9 @@
+import json
+import tempfile
 import unittest
 from contextlib import nullcontext
-import tempfile
 from pathlib import Path
-from types import MethodType
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 from transformers import TrainingArguments
 
+from exp.cxr_pt.hierarchy_metrics import compute_hierarchy_trainer_metrics
 from exp.cxr_pt.model.hierarchy_training import HierarchyTrainingController
 from exp.cxr_pt.run import _run_hierarchy_schedule
 from exp.cxr_pt.trainer import CXRPreTrainer, validate_hierarchy_schedule
@@ -421,6 +422,111 @@ class HierarchyTrainerTest(unittest.TestCase):
         self.assertEqual(len(labels), 6)
         self.assertIn("anatomy_loss", losses)
 
+    def test_prediction_step_runs_without_any_ground_truth(self):
+        self.trainer._prepare_inputs = lambda inputs: inputs
+        self.trainer.compute_loss_context_manager = nullcontext
+        inputs = {
+            key: value
+            for key, value in self.inputs.items()
+            if key not in {"anatomy_targets", "anatomy_valid_mask"}
+        }
+
+        loss, predictions, labels, losses = self.trainer.prediction_step(
+            self.model, inputs, prediction_loss_only=False
+        )
+
+        self.assertIsNone(loss)
+        self.assertIsNone(labels)
+        self.assertEqual(losses, {})
+        self.assertEqual(len(predictions), 3)
+
+    def test_prediction_step_supports_global_only_supervision(self):
+        self.model.configure_hierarchy_training("global")
+        self.trainer._prepare_inputs = lambda inputs: inputs
+        self.trainer.compute_loss_context_manager = nullcontext
+        inputs = {
+            key: value
+            for key, value in self.inputs.items()
+            if key not in {"anatomy_targets", "anatomy_valid_mask"}
+        }
+        inputs["global_targets"] = torch.randint(0, 2, (2, 5)).float()
+        inputs["global_valid_mask"] = torch.ones(2, 5, dtype=torch.bool)
+
+        loss, predictions, labels, losses = self.trainer.prediction_step(
+            self.model, inputs, prediction_loss_only=False
+        )
+        metrics = compute_hierarchy_trainer_metrics(
+            SimpleNamespace(predictions=predictions, label_ids=labels),
+            stage="global",
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("global_loss", losses)
+        self.assertTrue(any(key.startswith("global_") for key in metrics))
+        self.assertFalse(any(key.startswith("anatomy_") for key in metrics))
+        self.assertFalse(any(key.startswith("finding_") for key in metrics))
+
+    def test_hierarchy_inference_exports_intervention_tensors_without_gt(self):
+        self.trainer._prepare_inputs = lambda inputs: inputs
+        self.trainer.compute_loss_context_manager = nullcontext
+        inputs = dict(self.inputs)
+        inputs.update(
+            {
+                "gt_anatomy_masks": torch.zeros_like(inputs["anatomy_targets"]),
+                "finding_targets": torch.zeros(2, 3, 4),
+                "finding_valid_mask": torch.ones(2, 3, 4, dtype=torch.bool),
+                "global_targets": torch.zeros(2, 5),
+                "global_valid_mask": torch.ones(2, 5, dtype=torch.bool),
+            }
+        )
+
+        exported = self.trainer.inference_step(self.model, inputs, ignore_keys=None)
+
+        expected = {
+            "anatomy_masks",
+            "anatomy_roi_logits",
+            "finding_logits",
+            "finding_attention",
+            "finding_evidence",
+            "finding_matching_scores",
+            "finding_pair_mask",
+            "finding_evidence_attention",
+            "finding_null_attention",
+            "aggregated_finding_evidence",
+            "global_evidence",
+            "global_gates",
+            "global_logits",
+            "fused_evidence",
+        }
+        self.assertTrue(expected.issubset(exported))
+        self.assertEqual(exported["global_logits"].shape, (2, 5))
+        self.assertEqual(exported["finding_evidence"].shape, (2, 3, 4, 8))
+
+    def test_save_hierarchy_inference_writes_npz_and_manifest(self):
+        self.trainer.args = SimpleNamespace(output_dir="unused")
+        self.trainer.state = SimpleNamespace(global_step=9)
+        predictions = {
+            "global_logits": torch.randn(2, 5).numpy(),
+            "global_gates": torch.rand(2, 5, 1).numpy(),
+        }
+        output = SimpleNamespace(
+            predictions=predictions,
+            num_samples=2,
+            metrics={"test_runtime": 0.1},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            results = self.trainer.save_inference_outputs(
+                output, output_dir=directory, checkpoint_name="checkpoint-9"
+            )
+            tensor_path = Path(results["tensor_path"])
+            manifest_path = Path(results["manifest_path"])
+            self.assertTrue(tensor_path.is_file())
+            self.assertTrue(manifest_path.is_file())
+            manifest = json.loads(manifest_path.read_text())
+
+        self.assertEqual(manifest["num_samples"], 2)
+        self.assertEqual(manifest["outputs"]["global_logits"]["shape"], [2, 5])
+
     def test_standard_trainer_evaluate_reports_anatomy_metrics(self):
         sample = {
             "pixel_values": self.inputs["pixel_values"][0],
@@ -518,6 +624,90 @@ class HierarchyTrainerTest(unittest.TestCase):
                 for name, parameter in self.model.finding_head.named_parameters()
             )
         )
+
+    def test_global_optimizer_updates_only_aggregator_and_fusion(self):
+        self.model.configure_hierarchy_training("global")
+        inputs = dict(self.inputs)
+        inputs.update(
+            {
+                "global_targets": torch.randint(0, 2, (2, 5)).float(),
+                "global_valid_mask": torch.ones(2, 5, dtype=torch.bool),
+            }
+        )
+        optimizer = torch.optim.Adam(
+            [
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            ],
+            lr=1e-2,
+        )
+        optimizer_ids = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        expected_ids = {
+            id(parameter)
+            for module_name in ("finding_aggregator", "evidence_fusion")
+            for parameter in getattr(self.model, module_name).parameters()
+        }
+        self.assertEqual(optimizer_ids, expected_ids)
+        before_trainable = {
+            module_name: {
+                name: parameter.detach().clone()
+                for name, parameter in getattr(
+                    self.model, module_name
+                ).named_parameters()
+            }
+            for module_name in ("finding_aggregator", "evidence_fusion")
+        }
+        frozen_modules = (
+            "vision_model",
+            "text_model",
+            "align_transformer",
+            "anatomy_head",
+            "finding_head",
+        )
+        before_frozen = {
+            (module_name, name): parameter.detach().clone()
+            for module_name in frozen_modules
+            for name, parameter in getattr(self.model, module_name).named_parameters()
+        }
+
+        for step in range(2):
+            self.trainer.state.global_step = step
+            optimizer.zero_grad()
+            loss = self.trainer.compute_loss(self.model, inputs)
+            loss.backward()
+            self.assertTrue(
+                all(
+                    parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                    for group in optimizer.param_groups
+                    for parameter in group["params"]
+                )
+            )
+            optimizer.step()
+
+        for module_name in ("finding_aggregator", "evidence_fusion"):
+            self.assertTrue(
+                any(
+                    not torch.equal(
+                        before_trainable[module_name][name], parameter.detach()
+                    )
+                    for name, parameter in getattr(
+                        self.model, module_name
+                    ).named_parameters()
+                )
+            )
+        for module_name in frozen_modules:
+            for name, parameter in getattr(self.model, module_name).named_parameters():
+                torch.testing.assert_close(
+                    parameter.detach(),
+                    before_frozen[(module_name, name)],
+                    rtol=0,
+                    atol=0,
+                )
 
     def test_hierarchy_batch_routes_to_forward_and_reports_stage_metadata(self):
         loss, outputs = self.trainer.compute_loss(
