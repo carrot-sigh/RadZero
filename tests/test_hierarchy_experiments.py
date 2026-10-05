@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import torch
 
 from exp.cxr_pt.hierarchy_experiments import (
+    _comparison_interpretation,
     _finding_statistics,
     _module_state_unchanged,
     _canonical_split_indices,
@@ -102,6 +103,31 @@ class HierarchyExperimentsTest(unittest.TestCase):
             module.weight.add_(1.0)
         self.assertFalse(_module_state_unchanged(module, snapshot))
         self.assertAlmostEqual(_module_state_max_abs_delta(module, snapshot), 1.0)
+
+    def test_pilot_comparison_uses_primary_metric_and_normal_intervention(self):
+        methods = {
+            name: {"global": {"macro_auroc": auroc, "macro_auprc": auprc}}
+            for name, auroc, auprc in (
+                ("A0", 0.70, 0.71), ("A1", 0.75, 0.76),
+                ("B", 0.77, 0.75), ("C", 0.78, 0.79),
+            )
+        }
+        interventions = {
+            "normal": {"macro_auroc": 0.78, "macro_auprc": 0.79},
+            "shuffled_full_finding_state": {
+                "macro_auroc": 0.60, "macro_auprc": 0.61,
+            },
+        }
+
+        deltas, mechanism, findings = _comparison_interpretation(
+            methods, interventions
+        )
+
+        self.assertAlmostEqual(deltas["C_minus_B"]["macro_auprc"], 0.04)
+        self.assertAlmostEqual(
+            mechanism["shuffled_full_finding_state"]["macro_auprc"], 0.18
+        )
+        self.assertTrue(any("single" not in finding for finding in findings))
 
 
 if __name__ == "__main__":

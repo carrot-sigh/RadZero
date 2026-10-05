@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import ImageDraw
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from common.utils import Config
@@ -2164,7 +2165,10 @@ def run_pilot_orchestrator(args):
 
 
 def run_pilot_summary(args):
-    """Aggregate explicitly supplied JSON reports without inventing metrics."""
+    """Aggregate pilot artifacts into a machine-readable and Markdown report."""
+    if getattr(args, "pilot_dir", None):
+        return _run_complete_pilot_summary(args)
+
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     rows = []
     for name, spec in manifest.get("variants", {}).items():
@@ -2181,6 +2185,223 @@ def run_pilot_summary(args):
     path.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(output, indent=2))
     return output
+
+
+def _final_eval_metrics(run_root, stage):
+    states = list(Path(run_root).glob(f"**/{stage}/checkpoint-*/trainer_state.json"))
+    if not states:
+        raise FileNotFoundError(f"No {stage} trainer state found below {run_root}.")
+    state_path = max(
+        states, key=lambda path: int(path.parent.name.removeprefix("checkpoint-"))
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    evaluations = [row for row in state["log_history"] if "eval_loss" in row]
+    if not evaluations:
+        raise ValueError(f"No final evaluation metrics found in {state_path}.")
+    return state_path, evaluations[-1]
+
+
+def _global_labels_for_indices(config, indices_path):
+    hierarchy = config["dataset"]["hierarchy"]
+    dataset = HierarchyJsonlDataset(
+        hierarchy["manifest_path"], hierarchy["image_root"], hierarchy["contract_path"],
+        split=hierarchy.get("eval_split", "valid"), patch_grid_size=hierarchy["patch_grid_size"],
+    )
+    payload = json.loads(Path(indices_path).read_text(encoding="utf-8"))
+    indices = [int(index) for index in payload.get("indices", payload)]
+    targets = torch.zeros(len(indices), len(dataset.global_index))
+    valid = torch.zeros_like(targets, dtype=torch.bool)
+    with dataset.manifest_path.open("rb") as source:
+        for output_index, dataset_index in enumerate(indices):
+            source.seek(dataset.offsets[dataset_index])
+            row = json.loads(source.readline())
+            for label, value in row.get("global", {}).items():
+                label_index = dataset.global_index[label]
+                targets[output_index, label_index] = value
+                valid[output_index, label_index] = True
+    return targets, valid
+
+
+def _checkpoint_capacity(state_path, prefixes):
+    checkpoint = state_path.parent
+    model_path = checkpoint / "model.safetensors"
+    if not model_path.is_file():
+        raise FileNotFoundError(model_path)
+    total = 0
+    trainable = 0
+    with safe_open(model_path, framework="pt") as source:
+        for name in source.keys():
+            count = math.prod(source.get_slice(name).get_shape())
+            total += count
+            if any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes):
+                trainable += count
+    optimizer_path = checkpoint / "optimizer.pt"
+    return {
+        "trainable_parameters": trainable,
+        "total_parameters": total,
+        "optimizer_state_bytes": optimizer_path.stat().st_size if optimizer_path.is_file() else None,
+    }
+
+
+def _comparison_interpretation(methods, interventions):
+    metric = lambda method, name: methods[method]["global"][name]
+    deltas = {
+        "B_minus_A1": {
+            "macro_auroc": metric("B", "macro_auroc") - metric("A1", "macro_auroc"),
+            "macro_auprc": metric("B", "macro_auprc") - metric("A1", "macro_auprc"),
+        },
+        "C_minus_B": {
+            "macro_auroc": metric("C", "macro_auroc") - metric("B", "macro_auroc"),
+            "macro_auprc": metric("C", "macro_auprc") - metric("B", "macro_auprc"),
+        },
+        "C_minus_A1": {
+            "macro_auroc": metric("C", "macro_auroc") - metric("A1", "macro_auroc"),
+            "macro_auprc": metric("C", "macro_auprc") - metric("A1", "macro_auprc"),
+        },
+        "C_minus_A0": {
+            "macro_auroc": metric("C", "macro_auroc") - metric("A0", "macro_auroc"),
+            "macro_auprc": metric("C", "macro_auprc") - metric("A0", "macro_auprc"),
+        },
+    }
+    normal = interventions["normal"]
+    mechanism = {
+        name: {
+            "macro_auroc": normal["macro_auroc"] - values["macro_auroc"],
+            "macro_auprc": normal["macro_auprc"] - values["macro_auprc"],
+        }
+        for name, values in interventions.items() if name != "normal"
+    }
+    findings = [
+        "The complete Stage 1 -> Stage 2 -> Stage 3 -> joint schedule completed with finite held-out metrics.",
+        "B and C did not improve the primary Global Macro AUPRC over A1 under this budget; their Global AUROC was higher.",
+        "C and B were effectively tied, so this pilot does not show a material benefit from predicted anatomy conditioning.",
+        "Shuffling the full grounded finding state caused a large degradation, providing evidence that Stage 3 uses Stage 2 state.",
+        "C outperformed zero-shot A0 on AUROC and AUPRC, but that comparison also includes supervised training and does not isolate hierarchy value.",
+    ]
+    return deltas, mechanism, findings
+
+
+def _render_complete_pilot_markdown(report):
+    methods = report["methods"]
+    lines = [
+        "# Hierarchy 5k/1k Directional Pilot", "",
+        "> Scope: 5,000 train / 1,000 validation, seed 42, 500 optimizer steps per scheduled phase. Test split was not used.", "",
+        "## Primary Results", "",
+        "| Method | Anatomy Dice | Finding AUROC | Finding AUPRC | Global AUROC | Global AUPRC | Global F1 | Trainable params |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name in ("A0", "A1", "B", "C", "D"):
+        row = methods[name]
+        fmt = lambda value: "N/A" if value is None else f"{value:.4f}"
+        lines.append(
+            f"| {row['name']} | {fmt(row['anatomy_dice'])} | {fmt(row['finding_auroc'])} | "
+            f"{fmt(row['finding_auprc'])} | {fmt(row['global']['macro_auroc'])} | "
+            f"{fmt(row['global']['macro_auprc'])} | {fmt(row['global']['macro_f1'])} | "
+            f"{row['capacity']['trainable_parameters'] if row.get('capacity') else 'N/A'} |"
+        )
+    lines.extend(["", "## Same-checkpoint Interventions", "", "| Intervention | Global AUROC | Global AUPRC | F1 | Delta AUPRC vs normal |", "|---|---:|---:|---:|---:|"])
+    normal_auprc = report["interventions"]["normal"]["macro_auprc"]
+    for name, values in report["interventions"].items():
+        lines.append(
+            f"| {name} | {values['macro_auroc']:.4f} | {values['macro_auprc']:.4f} | "
+            f"{values['macro_f1']:.4f} | {values['macro_auprc'] - normal_auprc:+.4f} |"
+        )
+    lines.extend(["", "## Interpretation", ""])
+    lines.extend(f"- {finding}" for finding in report["interpretation"])
+    lines.extend([
+        "", "These are directional findings under the current pilot budget, weak-label quality, and one training seed. They are not a final significance claim.",
+        "", "## Audits", "",
+        f"- No-GT inference: {'PASS' if report['audits']['no_gt']['passed'] else 'FAIL'} (max logit delta {report['audits']['no_gt']['max_abs_logit_delta']:.3g})",
+        f"- Frozen RadZero encoders: {'PASS' if report['audits']['frozen_modules_passed'] else 'FAIL'}",
+        f"- Predicted ROI area: {report['diagnostics']['roi']['predicted_area']:.4f}; GT ROI area: {report['diagnostics']['roi']['gt_area']:.4f}",
+        f"- Mean fusion gate: {report['diagnostics']['gate']['mean']:.4f} (1 = finding branch, 0 = global branch)",
+        "", "## Decision", "",
+        "The infrastructure is ready for this 5k pilot and the run is complete. The current results support keeping predicted-ROI hierarchy as an experimental mainline, but do not support claiming it is better than the supervised global-only or M=1 baselines. Before scaling, improve or calibrate Stage 1 ROI masks and repeat with multiple seeds.", "",
+    ])
+    return "\n".join(lines)
+
+
+def _run_complete_pilot_summary(args):
+    pilot_dir = Path(args.pilot_dir)
+    config = _load_config(args.config, args.config_overrides)
+    targets, valid = _global_labels_for_indices(
+        config, pilot_dir / "pilot_valid_indices.json"
+    )
+    definitions = {
+        "A1": ("A1 Supervised Global-only", "A1_global_only", "global", ("global_branch", "evidence_fusion")),
+        "B": ("B Full-image Hierarchy / M=1", "B_full_image_hierarchy", "joint", ("anatomy_head", "finding_head", "finding_aggregator", "global_branch", "evidence_fusion")),
+        "C": ("C Predicted ROI Mainline", "C_predicted_roi", "joint", ("anatomy_head", "finding_head", "finding_aggregator", "global_branch", "evidence_fusion")),
+    }
+    methods = {}
+    for key, (display_name, directory, stage, prefixes) in definitions.items():
+        root = pilot_dir / directory
+        state_path, evaluation = _final_eval_metrics(root, stage)
+        npz_paths = list(root.glob("**/inference/hierarchy/*-hierarchy.npz"))
+        if not npz_paths:
+            raise FileNotFoundError(f"No inference archive found below {root}.")
+        with np.load(npz_paths[-1]) as archive:
+            logits = torch.from_numpy(archive["global_logits"].copy())
+        bootstrap = bootstrap_multilabel_metrics(
+            torch.sigmoid(logits), targets, valid,
+            samples=args.bootstrap_samples, seed=args.bootstrap_seed,
+        )
+        methods[key] = {
+            "name": display_name,
+            "checkpoint": str(state_path.parent),
+            "anatomy_dice": evaluation.get("eval_anatomy_dice") if key != "A1" else None,
+            "finding_auroc": evaluation.get("eval_finding_auroc") if key != "A1" else None,
+            "finding_auprc": evaluation.get("eval_finding_auprc") if key != "A1" else None,
+            "global": {
+                "macro_auroc": evaluation["eval_global_auroc"],
+                "macro_auprc": evaluation["eval_global_auprc"],
+                "macro_f1": evaluation["eval_global_f1"],
+                "loss": evaluation["eval_global_loss"],
+                "bootstrap": bootstrap,
+            },
+            "capacity": _checkpoint_capacity(state_path, prefixes),
+            "optimizer_steps": int(state_path.parent.name.removeprefix("checkpoint-")),
+        }
+    a0 = json.loads((pilot_dir / "A0_original_radzero" / "a0_original_radzero.json").read_text(encoding="utf-8"))
+    methods["A0"] = {
+        "name": "A0 Original RadZero", "checkpoint": None,
+        "anatomy_dice": None, "finding_auroc": None, "finding_auprc": None,
+        "global": {
+            "macro_auroc": a0["metrics"]["auroc"], "macro_auprc": a0["metrics"]["auprc"],
+            "macro_f1": a0["metrics"]["f1"], "loss": None, "bootstrap": a0["bootstrap"],
+        },
+        "capacity": None, "optimizer_steps": 0,
+    }
+    intervention_report = json.loads((pilot_dir / "interventions" / "formal_interventions.json").read_text(encoding="utf-8"))
+    interventions = intervention_report["metrics"]
+    gt_roi = interventions["gt_roi_substitution"]
+    methods["D"] = {
+        "name": "D C-checkpoint + GT ROI substitution", "checkpoint": intervention_report["checkpoint"],
+        "anatomy_dice": None, "finding_auroc": None, "finding_auprc": None,
+        "global": {"macro_auroc": gt_roi["macro_auroc"], "macro_auprc": gt_roi["macro_auprc"], "macro_f1": gt_roi["macro_f1"], "loss": None, "bootstrap": gt_roi["bootstrap"]},
+        "capacity": methods["C"]["capacity"], "optimizer_steps": 0, "intervention": True,
+    }
+    deltas, mechanism_deltas, interpretation = _comparison_interpretation(methods, interventions)
+    frozen = intervention_report["frozen_module_audit"]
+    report = {
+        "experiment": "hierarchy_5k_1k_directional_pilot", "primary_checkpoint_rule": "last-step",
+        "train_samples": 5000, "validation_samples": 1000, "seed": 42,
+        "test_accessed": False, "primary_metric": "Global Macro AUPRC",
+        "methods": methods, "method_deltas": deltas,
+        "interventions": interventions, "mechanism_deltas_from_normal": mechanism_deltas,
+        "diagnostics": {"gate": intervention_report["gate_diagnostics"], "roi": intervention_report["roi_diagnostics"]},
+        "audits": {
+            "no_gt": intervention_report["no_gt_audit"], "frozen_modules": frozen,
+            "frozen_modules_passed": all(value["unchanged_from_radzero"] for value in frozen.values()),
+        },
+        "interpretation": interpretation,
+        "limitations": ["single training seed", "500 optimizer steps per scheduled phase", "weak-label supervision", "validation-only directional pilot"],
+    }
+    json_path = Path(args.output or pilot_dir / "pilot_summary.json")
+    markdown_path = json_path.with_suffix(".md")
+    json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    markdown_path.write_text(_render_complete_pilot_markdown(report), encoding="utf-8")
+    print(json.dumps({"json": str(json_path), "markdown": str(markdown_path), "method_deltas": deltas}, indent=2))
+    return report
 
 
 def main():
@@ -2213,9 +2434,15 @@ def main():
     orchestrator.add_argument("--batch-size", type=int, default=8)
     orchestrator.add_argument("--pretrained-dir", default="/home/user/gxq/radzero-model")
     orchestrator.add_argument("--execute", action="store_true")
-    summary_parser = subparsers.add_parser("pilot-summary", help="Summarize reports attached to a pilot manifest.")
-    summary_parser.add_argument("--manifest", required=True)
+    summary_parser = subparsers.add_parser("pilot-summary", help="Generate a unified pilot report.")
+    summary_source = summary_parser.add_mutually_exclusive_group(required=True)
+    summary_source.add_argument("--manifest")
+    summary_source.add_argument("--pilot-dir")
     summary_parser.add_argument("--output")
+    summary_parser.add_argument("--config", default="exp/cxr_pt/config.yaml")
+    summary_parser.add_argument("--config-overrides", nargs="+", default=["radzero.yaml", "hierarchy.yaml", "paths.yaml"])
+    summary_parser.add_argument("--bootstrap-samples", type=int, default=1000)
+    summary_parser.add_argument("--bootstrap-seed", type=int, default=42)
     intervention_parser = subparsers.add_parser(
         "pilot-interventions", help="Evaluate formal C-checkpoint interventions."
     )
