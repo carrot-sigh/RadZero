@@ -33,6 +33,7 @@ def validate_hierarchy_schedule(schedule):
     normalized = []
     for phase in schedule:
         epochs = phase.get("num_train_epochs")
+        max_steps = phase.get("max_steps")
         if (
             not isinstance(epochs, (int, float))
             or isinstance(epochs, bool)
@@ -42,7 +43,21 @@ def validate_hierarchy_schedule(schedule):
                 f"Hierarchy phase {phase['stage']!r} requires positive "
                 "num_train_epochs."
             )
-        normalized.append({"stage": phase["stage"], "num_train_epochs": float(epochs)})
+        if max_steps is not None and (
+            not isinstance(max_steps, int)
+            or isinstance(max_steps, bool)
+            or max_steps <= 0
+        ):
+            raise ValueError(
+                f"Hierarchy phase {phase['stage']!r} max_steps must be a positive integer."
+            )
+        normalized.append(
+            {
+                "stage": phase["stage"],
+                "num_train_epochs": float(epochs),
+                "max_steps": max_steps,
+            }
+        )
     return normalized
 
 

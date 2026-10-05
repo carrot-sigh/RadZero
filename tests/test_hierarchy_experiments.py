@@ -1,18 +1,53 @@
 import unittest
 from collections import UserDict
 from types import SimpleNamespace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 
 from exp.cxr_pt.hierarchy_experiments import (
     _finding_statistics,
     _module_state_unchanged,
+    _canonical_split_indices,
     _select_roi_masks,
     _to_device,
 )
 
 
 class HierarchyExperimentsTest(unittest.TestCase):
+    def test_canonical_split_indices_are_reproducible_and_reloadable(self):
+        # Python special methods are looked up on the class, so use a tiny class
+        # rather than relying on an instance attribute for len().
+        class DummyDataset:
+            split = "train"
+
+            def __len__(self):
+                return 100
+
+        dataset = DummyDataset()
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "indices.json"
+            first = _canonical_split_indices(dataset, 8, 42, path)
+            second = _canonical_split_indices(dataset, 8, 999, path)
+
+            self.assertEqual(first, second)
+            payload = path.read_text(encoding="utf-8")
+            self.assertIn('"split": "train"', payload)
+
+    def test_canonical_split_indices_reject_invalid_saved_file(self):
+        class DummyDataset:
+            split = "valid"
+
+            def __len__(self):
+                return 4
+
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "indices.json"
+            path.write_text('{"indices": [0, 0]}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _canonical_split_indices(DummyDataset(), 2, 42, path)
+
     def test_to_device_handles_mapping_subclasses(self):
         batch = UserDict({"tokens": torch.ones(2), "nested": {"mask": torch.zeros(2)}})
 

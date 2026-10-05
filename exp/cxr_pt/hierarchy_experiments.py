@@ -96,6 +96,47 @@ def _select_global_indices(dataset, count, seed, candidate_pool=512):
     return candidates[:count]
 
 
+def _canonical_split_indices(dataset, count, seed, indices_path=None):
+    """Return deterministic local indices for one canonical dataset split."""
+    if indices_path is not None:
+        path = Path(indices_path)
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            indices = payload.get("indices", payload)
+            indices = [int(index) for index in indices]
+            if len(indices) != count or len(set(indices)) != count:
+                raise ValueError(f"{path} must contain exactly {count} unique indices.")
+            if any(index < 0 or index >= len(dataset) for index in indices):
+                raise ValueError(f"{path} contains an out-of-range dataset index.")
+            return indices
+
+    if count > len(dataset):
+        raise ValueError(
+            f"Requested {count} samples from {dataset.split}, but only "
+            f"{len(dataset)} are available."
+        )
+    indices = list(range(len(dataset)))
+    random.Random(seed).shuffle(indices)
+    indices = sorted(indices[:count])
+    if indices_path is not None:
+        path = Path(indices_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "split": dataset.split,
+                    "seed": seed,
+                    "count": count,
+                    "indices": indices,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    return indices
+
+
 def _to_device(value, device):
     if torch.is_tensor(value):
         return value.to(device)
@@ -456,10 +497,27 @@ def run_stage1_pilot(args):
         split=hierarchy_config.get("eval_split", "valid"),
         patch_grid_size=hierarchy_config["patch_grid_size"],
     )
-    train_indices = _select_anatomy_indices(train_dataset, args.train_images, args.seed)
-    valid_indices = _select_anatomy_indices(
-        valid_dataset, args.valid_images, args.seed + 1
-    )
+    if args.indices_dir:
+        indices_dir = Path(args.indices_dir)
+        train_indices = _canonical_split_indices(
+            train_dataset,
+            args.train_images,
+            args.seed,
+            indices_dir / "pilot_train_indices.json",
+        )
+        valid_indices = _canonical_split_indices(
+            valid_dataset,
+            args.valid_images,
+            args.seed + 1,
+            indices_dir / "pilot_valid_indices.json",
+        )
+    else:
+        train_indices = _select_anatomy_indices(
+            train_dataset, args.train_images, args.seed
+        )
+        valid_indices = _select_anatomy_indices(
+            valid_dataset, args.valid_images, args.seed + 1
+        )
     train_cached = _cache_anatomy_features(
         model, train_dataset, train_indices, args.batch_size, models, device
     )
@@ -982,12 +1040,27 @@ def run_stage2_pilot(args):
             split=hierarchy_config.get("eval_split", "valid"),
             patch_grid_size=hierarchy_config["patch_grid_size"],
         )
-        train_indices = _select_balanced_indices(
-            train_dataset, args.train_images, args.seed
-        )
-        valid_indices = _select_balanced_indices(
-            valid_dataset, args.valid_images, args.seed + 1
-        )
+        if args.indices_dir:
+            indices_dir = Path(args.indices_dir)
+            train_indices = _canonical_split_indices(
+                train_dataset,
+                args.train_images,
+                args.seed,
+                indices_dir / "pilot_train_indices.json",
+            )
+            valid_indices = _canonical_split_indices(
+                valid_dataset,
+                args.valid_images,
+                args.seed + 1,
+                indices_dir / "pilot_valid_indices.json",
+            )
+        else:
+            train_indices = _select_balanced_indices(
+                train_dataset, args.train_images, args.seed
+            )
+            valid_indices = _select_balanced_indices(
+                valid_dataset, args.valid_images, args.seed + 1
+            )
         strategy_args = SimpleNamespace(
             finding_roi_strategy=strategy,
             roi_mode=args.roi_mode,
@@ -1559,6 +1632,21 @@ def run_stage3_tiny_overfit(args):
 def main():
     parser = argparse.ArgumentParser(description="Hierarchy real-data experiments.")
     subparsers = parser.add_subparsers(dest="experiment", required=True)
+    indices_parser = subparsers.add_parser(
+        "pilot-indices", help="Create or validate fixed canonical pilot indices."
+    )
+    indices_parser.add_argument("--config", default="exp/cxr_pt/config.yaml")
+    indices_parser.add_argument(
+        "--config-overrides",
+        nargs="+",
+        default=["radzero.yaml", "hierarchy.yaml", "paths.yaml"],
+    )
+    indices_parser.add_argument(
+        "--output-dir", default="/home/user/gxq/hierarchy-pilot"
+    )
+    indices_parser.add_argument("--train-images", type=int, default=5000)
+    indices_parser.add_argument("--valid-images", type=int, default=1000)
+    indices_parser.add_argument("--seed", type=int, default=42)
     stage2 = subparsers.add_parser("stage2-tiny-overfit")
     stage2.add_argument("--config", default="exp/cxr_pt/config.yaml")
     stage2.add_argument(
@@ -1608,6 +1696,7 @@ def main():
     stage1.add_argument("--max-grad-norm", type=float, default=10.0)
     stage1.add_argument("--log-every", type=int, default=20)
     stage1.add_argument("--seed", type=int, default=20260930)
+    stage1.add_argument("--indices-dir")
     pilot = subparsers.add_parser("stage2-pilot")
     pilot.add_argument("--config", default="exp/cxr_pt/config.yaml")
     pilot.add_argument(
@@ -1632,6 +1721,7 @@ def main():
     pilot.add_argument("--max-grad-norm", type=float, default=10.0)
     pilot.add_argument("--log-every", type=int, default=20)
     pilot.add_argument("--seed", type=int, default=20260930)
+    pilot.add_argument("--indices-dir")
     pilot.add_argument("--context-margin", type=float, default=0.0)
     pilot.add_argument(
         "--roi-mode", choices=("gt", "shuffled", "predicted"), default="gt"
@@ -1659,7 +1749,50 @@ def main():
     stage3.add_argument("--roi-mode", choices=("predicted", "gt"), default="predicted")
     stage3.add_argument("--anatomy-checkpoint")
     args = parser.parse_args()
-    if args.experiment == "stage2-tiny-overfit":
+    if args.experiment == "pilot-indices":
+        config = _load_config(args.config, args.config_overrides)
+        hierarchy_config = config["dataset"]["hierarchy"]
+        train_dataset = HierarchyJsonlDataset(
+            hierarchy_config["manifest_path"],
+            hierarchy_config["image_root"],
+            hierarchy_config["contract_path"],
+            split=hierarchy_config.get("train_split", "train"),
+            patch_grid_size=hierarchy_config["patch_grid_size"],
+        )
+        valid_dataset = HierarchyJsonlDataset(
+            hierarchy_config["manifest_path"],
+            hierarchy_config["image_root"],
+            hierarchy_config["contract_path"],
+            split=hierarchy_config.get("eval_split", "valid"),
+            patch_grid_size=hierarchy_config["patch_grid_size"],
+        )
+        output_dir = Path(args.output_dir)
+        train_indices = _canonical_split_indices(
+            train_dataset,
+            args.train_images,
+            args.seed,
+            output_dir / "pilot_train_indices.json",
+        )
+        valid_indices = _canonical_split_indices(
+            valid_dataset,
+            args.valid_images,
+            args.seed + 1,
+            output_dir / "pilot_valid_indices.json",
+        )
+        report = {
+            "seed": args.seed,
+            "train_split": train_dataset.split,
+            "valid_split": valid_dataset.split,
+            "train_count": len(train_indices),
+            "valid_count": len(valid_indices),
+            "test_accessed": False,
+            "train_indices": str(output_dir / "pilot_train_indices.json"),
+            "valid_indices": str(output_dir / "pilot_valid_indices.json"),
+        }
+        report_path = output_dir / "pilot_indices.json"
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2))
+    elif args.experiment == "stage2-tiny-overfit":
         run_stage2_tiny_overfit(args)
     elif args.experiment == "stage1-pilot":
         run_stage1_pilot(args)

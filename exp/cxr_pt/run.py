@@ -60,7 +60,7 @@ def _run_hierarchy_schedule(models, dataset, data_collator, cfg, deepspeed):
         phase_train_config = copy.deepcopy(cfg["train"])
         phase_train_config["output_dir"] = os.path.join(root_output_dir, stage)
         phase_train_config["num_train_epochs"] = phase["num_train_epochs"]
-        phase_train_config["max_steps"] = -1
+        phase_train_config["max_steps"] = phase.get("max_steps", -1)
         training_args = TrainingArguments(
             **phase_train_config,
             deepspeed=copy.deepcopy(deepspeed),

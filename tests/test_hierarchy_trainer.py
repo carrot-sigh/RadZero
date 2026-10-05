@@ -72,6 +72,22 @@ class HierarchyTrainerTest(unittest.TestCase):
                 [*schedule[:2], {"stage": "global", "num_train_epochs": 0}, schedule[3]]
             )
 
+    def test_hierarchy_schedule_accepts_positive_max_steps(self):
+        schedule = [
+            {"stage": stage, "num_train_epochs": 1, "max_steps": 25}
+            for stage in ("anatomy", "finding", "global", "joint")
+        ]
+        normalized = validate_hierarchy_schedule(schedule)
+        self.assertEqual([phase["max_steps"] for phase in normalized], [25] * 4)
+        with self.assertRaisesRegex(ValueError, "max_steps"):
+            validate_hierarchy_schedule(
+                [
+                    *schedule[:2],
+                    {"stage": "global", "num_train_epochs": 1, "max_steps": 0},
+                    schedule[3],
+                ]
+            )
+
     def test_formal_schedule_runs_each_stage_with_fresh_trainer(self):
         configured_stages = []
         model = SimpleNamespace(configure_hierarchy_training=configured_stages.append)

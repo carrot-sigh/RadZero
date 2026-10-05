@@ -1,0 +1,27 @@
+# Directional pilot overrides. Keep the canonical hierarchy contract unchanged.
+model:
+  model_config:
+    hierarchy_config:
+      training:
+        teacher_forcing_start_ratio: 0.0
+        teacher_forcing_end_ratio: 0.0
+      training_schedule:
+        - stage: anatomy
+          num_train_epochs: 1
+          max_steps: 500
+        - stage: finding
+          num_train_epochs: 1
+          max_steps: 500
+        - stage: global
+          num_train_epochs: 1
+          max_steps: 500
+        - stage: joint
+          num_train_epochs: 1
+          max_steps: 500
+
+train:
+  evaluation_strategy: steps
+  eval_steps: 100
+  save_strategy: steps
+  save_steps: 100
+  logging_steps: 20
