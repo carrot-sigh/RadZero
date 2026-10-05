@@ -415,6 +415,41 @@ class HierarchicalModelTest(unittest.TestCase):
             output.global_evidence.attention_weights.size(-1), self.tokens + 1
         )
 
+    def test_eval_forward_is_invariant_to_ground_truth_fields(self):
+        self.model.eval()
+        with torch.no_grad():
+            reference = self.model.forward_hierarchy(
+                self.pixel_values,
+                self.encoded_anatomy,
+                self.encoded_finding,
+                self.encoded_global,
+            )
+            perturbed = self.model.forward_hierarchy(
+                self.pixel_values,
+                self.encoded_anatomy,
+                self.encoded_finding,
+                self.encoded_global,
+                gt_anatomy_masks=torch.rand_like(reference.anatomy.roi_masks),
+                anatomy_boxes=torch.rand(
+                    self.batch_size, self.anatomies, 4, device=self.pixel_values.device
+                ),
+                anatomy_targets=torch.rand(
+                    self.batch_size, self.anatomies, self.tokens,
+                    device=self.pixel_values.device,
+                ),
+                finding_targets=torch.rand(
+                    self.batch_size, self.anatomies, self.findings,
+                    device=self.pixel_values.device,
+                ),
+                global_targets=torch.rand(
+                    self.batch_size, self.globals, device=self.pixel_values.device
+                ),
+            )
+        torch.testing.assert_close(
+            reference.finding.finding_logits, perturbed.finding.finding_logits
+        )
+        torch.testing.assert_close(reference.fusion.logits, perturbed.fusion.logits)
+
     def test_hierarchy_loss_requires_at_least_one_target(self):
         with self.assertRaisesRegex(ValueError, "At least one hierarchy target"):
             self.model.forward_hierarchy(
