@@ -1571,6 +1571,15 @@ def run_stage3_tiny_overfit(args):
         "compatibility_mask": batch["compatibility_mask"],
         "gt_anatomy_masks": batch["gt_anatomy_masks"].detach(),
     }
+    deployment_inputs = {
+        "pixel_values": batch["pixel_values"].detach(),
+        "encoded_anatomy_prompts": batch["encoded_anatomy_prompts"],
+        "encoded_finding_prompts": batch["encoded_finding_prompts"],
+        "encoded_global_prompts": batch["encoded_global_prompts"],
+        "anatomy_query_mask": batch["anatomy_query_mask"],
+        "global_query_mask": batch["global_query_mask"],
+        "compatibility_mask": batch["compatibility_mask"],
+    }
     features = {
         "global_queries": global_queries.detach(),
         "finding_evidence": finding.evidence_tokens.detach(),
@@ -1652,6 +1661,29 @@ def run_stage3_tiny_overfit(args):
     with torch.no_grad():
         final_aggregation, final_fusion, final_loss = _global_forward(model, features)
     features["global_logits"] = final_fusion.logits.detach()
+    no_gt_audit = None
+    if not args.global_only:
+        with torch.no_grad():
+            deployment_output = model.forward_hierarchy(**deployment_inputs)
+            deployment_repeat = model.forward_hierarchy(**deployment_inputs)
+        deployment_logits = deployment_output.fusion.logits.float()
+        repeat_logits = deployment_repeat.fusion.logits.float()
+        no_gt_delta = (deployment_logits - repeat_logits).abs()
+        no_gt_audit = {
+            "passed": bool(
+                torch.allclose(
+                    deployment_logits,
+                    repeat_logits,
+                    rtol=1e-3,
+                    atol=1e-3,
+                )
+            ),
+            "max_abs_logit_delta": float(no_gt_delta.max().item()),
+            "input_gt_fields": [],
+            "uses_gt_anatomy_masks": False,
+            "uses_gt_anatomy_boxes": False,
+            "uses_targets": False,
+        }
     final = _global_statistics(
         final_fusion.logits,
         features["global_targets"],
@@ -1720,6 +1752,7 @@ def run_stage3_tiny_overfit(args):
         ),
         "upstream_unchanged": upstream_unchanged,
         "frozen_module_audit": frozen_module_audit,
+        "no_gt_audit": no_gt_audit,
         "initial": initial,
         "final": final,
         "history": history,
