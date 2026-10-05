@@ -1423,6 +1423,48 @@ def _run_stage3_interventions(
     return permutation.cpu().tolist(), variants, statistics
 
 
+def _stage3_roi_substitutions(model, features, inputs, bootstrap_samples, seed):
+    """Evaluate ROI substitutions with the already-trained Stage 3 modules."""
+    masks = inputs["gt_anatomy_masks"]
+    variants = {
+        "gt_roi_substitution": masks,
+        "full_roi_substitution": torch.ones_like(masks),
+    }
+    permutation = torch.roll(torch.arange(masks.size(0), device=masks.device), shifts=1)
+    variants["shuffled_roi"] = masks[permutation]
+    statistics = {}
+    for name, replacement in variants.items():
+        with torch.no_grad(), torch.autocast(
+            device_type=replacement.device.type,
+            dtype=torch.bfloat16,
+            enabled=replacement.device.type == "cuda",
+        ):
+            finding = model.finding_head(
+                inputs["finding_queries"],
+                inputs["visual_tokens"],
+                replacement,
+                anatomy_query_mask=inputs["anatomy_query_mask"],
+                compatibility_mask=inputs["compatibility_mask"],
+            )
+        variant_features = dict(features)
+        variant_features["finding_evidence"] = finding.evidence_tokens.detach()
+        variant_features["finding_logits"] = finding.finding_logits.detach()
+        variant_features["pair_mask"] = finding.pair_mask
+        aggregation, fusion, _ = _global_forward(model, variant_features)
+        statistics[name] = _intervention_statistics(
+            model,
+            fusion.logits,
+            features["global_logits"],
+            variant_features,
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=seed,
+        )
+        statistics[name]["roi_permutation"] = (
+            permutation.cpu().tolist() if name == "shuffled_roi" else None
+        )
+    return statistics
+
+
 def run_stage3_tiny_overfit(args):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -1512,6 +1554,13 @@ def run_stage3_tiny_overfit(args):
             global_query_mask=batch["global_query_mask"],
             temperature=model._radzero_attention_temperature(),
         )
+    substitution_inputs = {
+        "visual_tokens": vision["image_patch_tokens"].detach(),
+        "finding_queries": finding_queries.detach(),
+        "anatomy_query_mask": batch["anatomy_query_mask"],
+        "compatibility_mask": batch["compatibility_mask"],
+        "gt_anatomy_masks": batch["gt_anatomy_masks"].detach(),
+    }
     features = {
         "global_queries": global_queries.detach(),
         "finding_evidence": finding.evidence_tokens.detach(),
@@ -1588,6 +1637,7 @@ def run_stage3_tiny_overfit(args):
     model.eval()
     with torch.no_grad():
         final_aggregation, final_fusion, final_loss = _global_forward(model, features)
+    features["global_logits"] = final_fusion.logits.detach()
     final = _global_statistics(
         final_fusion.logits,
         features["global_targets"],
@@ -1613,6 +1663,13 @@ def run_stage3_tiny_overfit(args):
                 bootstrap_samples=args.bootstrap_samples,
                 bootstrap_seed=args.bootstrap_seed,
             )
+        )
+        roi_substitutions = _stage3_roi_substitutions(
+            model,
+            features,
+            substitution_inputs,
+            bootstrap_samples=args.bootstrap_samples,
+            seed=args.bootstrap_seed,
         )
     upstream_unchanged = {
         name: _module_state_unchanged(getattr(model, name), snapshot)
@@ -1644,6 +1701,7 @@ def run_stage3_tiny_overfit(args):
         "history": history,
         "intervention_permutation": intervention_permutation,
         "interventions": interventions,
+        "roi_substitutions": roi_substitutions,
         "loss_decreased": final["loss"] < initial["loss"],
         "all_values_finite": all(
             math.isfinite(item["loss"]) and math.isfinite(item["gradient_norm"])
