@@ -15,6 +15,7 @@ from PIL import ImageDraw
 from common.utils import Config
 from exp.cxr_pt.hierarchy_dataset import HierarchyJsonlDataset, hierarchy_collate_fn
 from exp.cxr_pt.hierarchy_metrics import multilabel_metrics
+from exp.cxr_pt.hierarchy_metrics import bootstrap_multilabel_metrics
 from exp.cxr_pt.hierarchy_metrics import anatomy_iou_dice
 from exp.cxr_pt.model import load_model, masks_to_feature_boxes
 
@@ -1324,7 +1325,9 @@ def _forced_gate_logits(model, aggregation, features, gate_value):
         return logits * features["global_query_mask"]
 
 
-def _intervention_statistics(model, logits, normal_logits, features):
+def _intervention_statistics(
+    model, logits, normal_logits, features, bootstrap_samples=1000, bootstrap_seed=42
+):
     valid = features["global_valid_mask"] & features["global_query_mask"]
     metrics = multilabel_metrics(
         torch.sigmoid(logits), features["global_targets"], valid
@@ -1338,16 +1341,31 @@ def _intervention_statistics(model, logits, normal_logits, features):
         global_query_mask=features["global_query_mask"],
     ).global_loss
     delta = (logits - normal_logits).abs()[valid].float()
-    return {
+    statistics = {
         "loss": float(loss.float().item()),
         "macro_auroc": metrics["auroc"],
         "macro_auprc": metrics["auprc"],
         "mean_absolute_logit_delta": float(delta.mean().item()),
         "max_absolute_logit_delta": float(delta.max().item()),
     }
+    statistics["bootstrap"] = bootstrap_multilabel_metrics(
+        torch.sigmoid(logits),
+        features["global_targets"],
+        valid,
+        samples=bootstrap_samples,
+        seed=bootstrap_seed,
+    )
+    return statistics
 
 
-def _run_stage3_interventions(model, features, normal_aggregation, normal_fusion):
+def _run_stage3_interventions(
+    model,
+    features,
+    normal_aggregation,
+    normal_fusion,
+    bootstrap_samples=1000,
+    bootstrap_seed=42,
+):
     permutation = torch.roll(
         torch.arange(
             features["finding_evidence"].size(0),
@@ -1392,7 +1410,14 @@ def _run_stage3_interventions(model, features, normal_aggregation, normal_fusion
     )
 
     statistics = {
-        name: _intervention_statistics(model, logits, normal_fusion.logits, features)
+        name: _intervention_statistics(
+            model,
+            logits,
+            normal_fusion.logits,
+            features,
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=bootstrap_seed,
+        )
         for name, logits in variants.items()
     }
     return permutation.cpu().tolist(), variants, statistics
@@ -1571,9 +1596,23 @@ def run_stage3_tiny_overfit(args):
         final_aggregation,
     )
     final["loss"] = float(final_loss.float().item())
+    final["bootstrap"] = bootstrap_multilabel_metrics(
+        torch.sigmoid(final_fusion.logits),
+        features["global_targets"],
+        features["global_valid_mask"] & features["global_query_mask"],
+        samples=args.bootstrap_samples,
+        seed=args.bootstrap_seed,
+    )
     with torch.no_grad():
         intervention_permutation, intervention_logits, interventions = (
-            _run_stage3_interventions(model, features, final_aggregation, final_fusion)
+            _run_stage3_interventions(
+                model,
+                features,
+                final_aggregation,
+                final_fusion,
+                bootstrap_samples=args.bootstrap_samples,
+                bootstrap_seed=args.bootstrap_seed,
+            )
         )
     upstream_unchanged = {
         name: _module_state_unchanged(getattr(model, name), snapshot)
@@ -1785,6 +1824,8 @@ def main():
         default="masked_attention",
     )
     stage3.add_argument("--global-only", action="store_true")
+    stage3.add_argument("--bootstrap-samples", type=int, default=1000)
+    stage3.add_argument("--bootstrap-seed", type=int, default=42)
     stage3.add_argument("--roi-mode", choices=("predicted", "gt"), default="predicted")
     stage3.add_argument("--anatomy-checkpoint")
     args = parser.parse_args()

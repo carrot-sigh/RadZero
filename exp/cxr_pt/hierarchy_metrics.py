@@ -56,6 +56,43 @@ def multilabel_metrics(
     return output
 
 
+def bootstrap_multilabel_metrics(
+    scores, targets, valid_mask=None, samples=1000, seed=42
+):
+    """Return point estimates and study-row bootstrap CIs for multilabel metrics."""
+    scores_np, targets_np, valid_np = _classification_arrays(
+        scores, targets, valid_mask
+    )
+    if samples <= 0:
+        raise ValueError("bootstrap samples must be positive")
+    rng = np.random.default_rng(seed)
+    point = multilabel_metrics(scores_np, targets_np, valid_np)
+    draws = {name: [] for name in ("f1", "auroc", "auprc")}
+    for _ in range(samples):
+        indices = rng.integers(0, scores_np.shape[0], scores_np.shape[0])
+        draw = multilabel_metrics(
+            scores_np[indices], targets_np[indices], valid_np[indices]
+        )
+        for name in draws:
+            value = draw[name]
+            if np.isfinite(value):
+                draws[name].append(float(value))
+    result = {"point": {name: float(value) for name, value in point.items()}}
+    result["ci95"] = {}
+    for name, values in draws.items():
+        if not values:
+            result["ci95"][name] = None
+            continue
+        result["ci95"][name] = {
+            "lower": float(np.percentile(values, 2.5)),
+            "upper": float(np.percentile(values, 97.5)),
+            "valid_draws": len(values),
+        }
+    result["samples"] = samples
+    result["seed"] = seed
+    return result
+
+
 def _macro_f1(scores, targets, valid, predictions):
     values = []
     for index in range(targets.shape[1]):

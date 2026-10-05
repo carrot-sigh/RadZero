@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from exp.cxr_pt.hierarchy_metrics import (
     anatomy_iou_dice,
+    bootstrap_multilabel_metrics,
     compute_hierarchy_trainer_metrics,
     export_hierarchy_output,
     evaluate_hierarchy_loader,
@@ -16,6 +17,16 @@ from exp.cxr_pt.hierarchy_metrics import (
 
 
 class HierarchyMetricsTest(unittest.TestCase):
+    def test_bootstrap_multilabel_metrics_is_reproducible(self):
+        scores = torch.tensor([[0.95, 0.05], [0.1, 0.9], [0.8, 0.2], [0.2, 0.8]])
+        targets = torch.tensor([[1, 0], [0, 1], [1, 0], [0, 1]])
+        first = bootstrap_multilabel_metrics(scores, targets, samples=50, seed=7)
+        second = bootstrap_multilabel_metrics(scores, targets, samples=50, seed=7)
+        self.assertEqual(first, second)
+        self.assertEqual(first["samples"], 50)
+        self.assertGreater(first["ci95"]["auprc"]["valid_draws"], 0)
+        self.assertLessEqual(first["ci95"]["auprc"]["valid_draws"], 50)
+
     def test_anatomy_metrics_respect_validity(self):
         targets = torch.tensor(
             [[[[1, 1], [0, 0]], [[0, 0], [0, 0]]]], dtype=torch.float
