@@ -1364,12 +1364,28 @@ def _run_stage3_interventions(model, features, normal_aggregation, normal_fusion
     zero_evidence = dict(features)
     zero_evidence["finding_evidence"] = torch.zeros_like(features["finding_evidence"])
     _, fusion, _ = _global_forward(model, zero_evidence)
-    variants["zero_finding_evidence"] = fusion.logits
+    variants["zero_evidence_token"] = fusion.logits
 
-    shuffled_logits = dict(features)
-    shuffled_logits["finding_logits"] = features["finding_logits"][permutation]
-    _, fusion, _ = _global_forward(model, shuffled_logits)
-    variants["shuffled_finding_logits"] = fusion.logits
+    zero_logits = dict(features)
+    zero_logits["finding_logits"] = torch.zeros_like(features["finding_logits"])
+    _, fusion, _ = _global_forward(model, zero_logits)
+    variants["zero_finding_logits"] = fusion.logits
+
+    zero_full_state = dict(features)
+    zero_full_state["finding_evidence"] = torch.zeros_like(
+        features["finding_evidence"]
+    )
+    zero_full_state["finding_logits"] = torch.zeros_like(features["finding_logits"])
+    zero_full_state["pair_mask"] = torch.zeros_like(features["pair_mask"])
+    _, fusion, _ = _global_forward(model, zero_full_state)
+    variants["zero_full_finding_state"] = fusion.logits
+
+    shuffled_state = dict(features)
+    shuffled_state["finding_evidence"] = features["finding_evidence"][permutation]
+    shuffled_state["finding_logits"] = features["finding_logits"][permutation]
+    shuffled_state["pair_mask"] = features["pair_mask"][permutation]
+    _, fusion, _ = _global_forward(model, shuffled_state)
+    variants["shuffled_full_finding_state"] = fusion.logits
     variants["finding_only_gate_1"] = _forced_gate_logits(
         model, normal_aggregation, features, 1.0
     )
@@ -1391,6 +1407,8 @@ def run_stage3_tiny_overfit(args):
     device = torch.device(args.device)
     config = _load_config(args.config, args.config_overrides)
     hierarchy_config = config["dataset"]["hierarchy"]
+    model_hierarchy_config = config["model"]["model_config"]["hierarchy_config"]
+    model_hierarchy_config["finding_roi_strategy"] = args.finding_roi_strategy
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     models = load_model(config["model"], output_dir=str(output_dir))
@@ -1433,7 +1451,9 @@ def run_stage3_tiny_overfit(args):
         global_queries = model._encode_prompt_bank(
             batch["encoded_global_prompts"], model.num_global_labels, "global"
         )
-        if args.roi_mode == "predicted":
+        if args.finding_roi_strategy == "full":
+            finding_masks = torch.ones_like(batch["gt_anatomy_masks"])
+        elif args.roi_mode == "predicted":
             anatomy_queries = model._encode_prompt_bank(
                 batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy"
             )
@@ -1471,6 +1491,10 @@ def run_stage3_tiny_overfit(args):
         "global_targets": batch["global_targets"],
         "global_valid_mask": batch["global_valid_mask"],
     }
+    if args.global_only:
+        features["finding_evidence"] = torch.zeros_like(features["finding_evidence"])
+        features["finding_logits"] = torch.zeros_like(features["finding_logits"])
+        features["pair_mask"] = torch.zeros_like(features["pair_mask"])
     del vision, finding, global_evidence, global_visual_tokens, batch
 
     upstream_snapshots = {
@@ -1555,6 +1579,8 @@ def run_stage3_tiny_overfit(args):
         "num_images": args.num_images,
         "steps": args.steps,
         "roi_mode": args.roi_mode,
+        "finding_roi_strategy": args.finding_roi_strategy,
+        "global_only": args.global_only,
         "anatomy_checkpoint": args.anatomy_checkpoint,
         "uses_gt_anatomy_masks": args.roi_mode == "gt",
         "learning_rate": args.learning_rate,
@@ -1746,6 +1772,12 @@ def main():
     stage3.add_argument("--log-every", type=int, default=10)
     stage3.add_argument("--seed", type=int, default=20260930)
     stage3.add_argument("--finding-checkpoint", required=True)
+    stage3.add_argument(
+        "--finding-roi-strategy",
+        choices=("masked_attention", "full"),
+        default="masked_attention",
+    )
+    stage3.add_argument("--global-only", action="store_true")
     stage3.add_argument("--roi-mode", choices=("predicted", "gt"), default="predicted")
     stage3.add_argument("--anatomy-checkpoint")
     args = parser.parse_args()
