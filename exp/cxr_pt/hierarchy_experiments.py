@@ -1879,6 +1879,8 @@ def run_pilot_orchestrator(args):
             f"    eval_indices_path: {_yaml_scalar(valid_path)}\n"
             "train:\n"
             f"  seed: {args.seed}\n"
+            f"  per_device_train_batch_size: {args.batch_size}\n"
+            f"  per_device_eval_batch_size: {args.batch_size}\n"
             f"  eval_steps: {args.eval_steps}\n"
             f"  save_steps: {args.eval_steps}\n"
             "  evaluation_strategy: steps\n  save_strategy: steps\n"
@@ -1956,6 +1958,7 @@ def main():
     orchestrator.add_argument("--seed", type=int, default=42)
     orchestrator.add_argument("--max-steps", type=int, default=500)
     orchestrator.add_argument("--eval-steps", type=int, default=100)
+    orchestrator.add_argument("--batch-size", type=int, default=8)
     orchestrator.add_argument("--pretrained-dir", default="/home/user/gxq/radzero-model")
     orchestrator.add_argument("--execute", action="store_true")
     summary_parser = subparsers.add_parser("pilot-summary", help="Summarize reports attached to a pilot manifest.")
