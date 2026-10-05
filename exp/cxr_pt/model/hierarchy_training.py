@@ -82,6 +82,8 @@ class HierarchyTrainingController(nn.Module):
         for parameter in model.parameters():
             parameter.requires_grad = False
         module_names = list(self.STAGE_MODULES[stage])
+        if getattr(model, "global_only", False) and stage in {"global", "joint"}:
+            module_names = [name for name in module_names if name != "finding_aggregator"]
         if stage == "joint" and self.joint_train_encoders:
             module_names.extend(self.ENCODER_MODULES)
         for module_name in module_names:

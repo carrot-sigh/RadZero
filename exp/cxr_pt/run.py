@@ -1,9 +1,12 @@
 import argparse
 import copy
+import json
 import os
 from functools import partial
+from pathlib import Path
 
 import torch
+from torch.utils.data import Subset
 from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import EarlyStoppingCallback, TrainingArguments
 
@@ -154,21 +157,36 @@ def main():
     is_hierarchy = cfg["model"].get("model_class_name") == "HierarchicalCxrAlignModel"
     if is_hierarchy:
         hierarchy_cfg = cfg["dataset"]["hierarchy"]
-        dataset = {
-            "train": HierarchyJsonlDataset(
+        train_dataset = HierarchyJsonlDataset(
                 hierarchy_cfg["manifest_path"],
                 hierarchy_cfg["image_root"],
                 hierarchy_cfg["contract_path"],
                 split=hierarchy_cfg.get("train_split", "train"),
                 patch_grid_size=hierarchy_cfg["patch_grid_size"],
-            ),
-            "eval": HierarchyJsonlDataset(
+        )
+        eval_dataset = HierarchyJsonlDataset(
                 hierarchy_cfg["manifest_path"],
                 hierarchy_cfg["image_root"],
                 hierarchy_cfg["contract_path"],
                 split=hierarchy_cfg.get("eval_split", "valid"),
                 patch_grid_size=hierarchy_cfg["patch_grid_size"],
-            ),
+        )
+        # Pilot runs may provide fixed local indices.  Subset is applied after
+        # split filtering, so a train index can never address validation/test.
+        def _subset(dataset_obj, path_key):
+            path = hierarchy_cfg.get(path_key)
+            if not path:
+                return dataset_obj
+            path = Path(path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            indices = payload.get("indices", payload)
+            if len(indices) == 0 or any(int(i) < 0 or int(i) >= len(dataset_obj) for i in indices):
+                raise ValueError(f"Invalid hierarchy pilot indices in {path}.")
+            return Subset(dataset_obj, [int(i) for i in indices])
+
+        dataset = {
+            "train": _subset(train_dataset, "train_indices_path"),
+            "eval": _subset(eval_dataset, "eval_indices_path"),
         }
         data_collator = partial(
             hierarchy_collate_fn,

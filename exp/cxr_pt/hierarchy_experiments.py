@@ -2,6 +2,8 @@ import argparse
 import json
 import math
 import random
+import subprocess
+import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -1815,6 +1817,111 @@ def run_stage3_tiny_overfit(args):
     return report
 
 
+def _yaml_scalar(value):
+    return json.dumps(str(value))
+
+
+def run_pilot_orchestrator(args):
+    """Create one reproducible A1/B/C pilot plan and optionally execute it.
+
+    The generated variant files are ordinary Config YAML overlays, so the
+    actual training remains in the canonical ``run.py`` entry point.
+    """
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_overrides = list(args.config_overrides)
+    config = _load_config(args.config, config_overrides)
+    hierarchy = config["dataset"]["hierarchy"]
+    train_dataset = HierarchyJsonlDataset(
+        hierarchy["manifest_path"], hierarchy["image_root"], hierarchy["contract_path"],
+        split=hierarchy.get("train_split", "train"), patch_grid_size=hierarchy["patch_grid_size"],
+    )
+    valid_dataset = HierarchyJsonlDataset(
+        hierarchy["manifest_path"], hierarchy["image_root"], hierarchy["contract_path"],
+        split=hierarchy.get("eval_split", "valid"), patch_grid_size=hierarchy["patch_grid_size"],
+    )
+    train_path = output_dir / "pilot_train_indices.json"
+    valid_path = output_dir / "pilot_valid_indices.json"
+    train_indices = _canonical_split_indices(train_dataset, args.train_images, args.seed, train_path)
+    valid_indices = _canonical_split_indices(valid_dataset, args.valid_images, args.seed + 1, valid_path)
+    variants = {
+        "A1_global_only": {"global_only": True, "finding_roi_strategy": "full",
+                           "schedule": [("global", args.max_steps)]},
+        "B_full_image_hierarchy": {"global_only": False, "finding_roi_strategy": "full",
+                                    "schedule": [(stage, args.max_steps) for stage in ("anatomy", "finding", "global", "joint")]},
+        "C_predicted_roi": {"global_only": False, "finding_roi_strategy": "masked_attention",
+                             "schedule": [(stage, args.max_steps) for stage in ("anatomy", "finding", "global", "joint")]},
+    }
+    manifest = {
+        "seed": args.seed, "train_count": len(train_indices), "valid_count": len(valid_indices),
+        "test_accessed": False, "train_indices": str(train_path), "valid_indices": str(valid_path),
+        "variants": {},
+    }
+    for name, spec in variants.items():
+        variant_dir = output_dir / name
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        overlay = variant_dir / "pilot_variant.yaml"
+        phases = "\n".join(
+            f"        - stage: {stage}\n          num_train_epochs: 1\n          max_steps: {steps}"
+            for stage, steps in spec["schedule"]
+        )
+        overlay.write_text(
+            "model:\n  model_config:\n    hierarchy_config:\n"
+            f"      global_only: {'true' if spec['global_only'] else 'false'}\n"
+            f"      finding_roi_strategy: {spec['finding_roi_strategy']}\n"
+            "      training:\n        teacher_forcing_start_ratio: 0.0\n"
+            "        teacher_forcing_end_ratio: 0.0\n"
+            "      training_schedule:\n" + phases + "\n"
+            "dataset:\n  hierarchy:\n"
+            f"    train_indices_path: {_yaml_scalar(train_path)}\n"
+            f"    eval_indices_path: {_yaml_scalar(valid_path)}\n"
+            "train:\n"
+            f"  output_dir: {_yaml_scalar(variant_dir / 'run')}\n"
+            f"  seed: {args.seed}\n"
+            f"  eval_steps: {args.eval_steps}\n"
+            f"  save_steps: {args.eval_steps}\n"
+            "  evaluation_strategy: steps\n  save_strategy: steps\n",
+            encoding="utf-8",
+        )
+        command = [
+            sys.executable, "-m", "exp.cxr_pt.run", "--cfg-path", args.config,
+            "--add_cfg_list", *config_overrides, str(overlay),
+            "--train", "true", "--inference", "true", "--no_report",
+        ]
+        manifest["variants"][name] = {"overlay": str(overlay), "command": command}
+        if args.execute:
+            subprocess.run(command, cwd=str(Path.cwd()), check=True)
+            reports = sorted(
+                (variant_dir / "run" / "inference" / "hierarchy").glob("*-hierarchy.json")
+            )
+            if reports:
+                manifest["variants"][name]["report"] = str(reports[-1])
+    manifest_path = output_dir / "pilot_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(manifest, indent=2))
+    return manifest
+
+
+def run_pilot_summary(args):
+    """Aggregate explicitly supplied JSON reports without inventing metrics."""
+    manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    rows = []
+    for name, spec in manifest.get("variants", {}).items():
+        report_path = spec.get("report")
+        report = json.loads(Path(report_path).read_text(encoding="utf-8")) if report_path and Path(report_path).is_file() else None
+        rows.append({
+            "method": name,
+            "report": report_path,
+            "available": report is not None,
+            "metrics": report.get("metrics", {}) if report else {},
+        })
+    output = {"manifest": args.manifest, "test_accessed": manifest.get("test_accessed", False), "methods": rows}
+    path = Path(args.output or Path(args.manifest).with_name("pilot_summary.json"))
+    path.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(output, indent=2))
+    return output
+
+
 def main():
     parser = argparse.ArgumentParser(description="Hierarchy real-data experiments.")
     subparsers = parser.add_subparsers(dest="experiment", required=True)
@@ -1833,6 +1940,19 @@ def main():
     indices_parser.add_argument("--train-images", type=int, default=5000)
     indices_parser.add_argument("--valid-images", type=int, default=1000)
     indices_parser.add_argument("--seed", type=int, default=42)
+    orchestrator = subparsers.add_parser("pilot-run", help="Create/execute reproducible A1/B/C pilot plan.")
+    orchestrator.add_argument("--config", default="exp/cxr_pt/config.yaml")
+    orchestrator.add_argument("--config-overrides", nargs="+", default=["radzero.yaml", "hierarchy.yaml", "paths.yaml"])
+    orchestrator.add_argument("--output-dir", default="/home/user/gxq/hierarchy-pilot")
+    orchestrator.add_argument("--train-images", type=int, default=5000)
+    orchestrator.add_argument("--valid-images", type=int, default=1000)
+    orchestrator.add_argument("--seed", type=int, default=42)
+    orchestrator.add_argument("--max-steps", type=int, default=500)
+    orchestrator.add_argument("--eval-steps", type=int, default=100)
+    orchestrator.add_argument("--execute", action="store_true")
+    summary_parser = subparsers.add_parser("pilot-summary", help="Summarize reports attached to a pilot manifest.")
+    summary_parser.add_argument("--manifest", required=True)
+    summary_parser.add_argument("--output")
     stage2 = subparsers.add_parser("stage2-tiny-overfit")
     stage2.add_argument("--config", default="exp/cxr_pt/config.yaml")
     stage2.add_argument(
@@ -1987,6 +2107,10 @@ def main():
         report_path = output_dir / "pilot_indices.json"
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report, indent=2))
+    elif args.experiment == "pilot-run":
+        run_pilot_orchestrator(args)
+    elif args.experiment == "pilot-summary":
+        run_pilot_summary(args)
     elif args.experiment == "stage2-tiny-overfit":
         run_stage2_tiny_overfit(args)
     elif args.experiment == "stage1-pilot":

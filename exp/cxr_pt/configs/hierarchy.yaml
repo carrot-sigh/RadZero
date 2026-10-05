@@ -15,6 +15,7 @@ model:
       # Mainline: Stage 1 predicted ROI -> Stage 2 masked attention.
       # feature_roi/full_refiner are explicit ablation strategies only.
       finding_roi_strategy: masked_attention
+      global_only: false
       feature_roi_size: 14
       feature_roi_context_margin: 0.0
       finding_local_refiner_dim: 128

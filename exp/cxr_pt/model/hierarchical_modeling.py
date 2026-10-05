@@ -85,6 +85,9 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         self.finding_roi_strategy = hierarchy_config.get(
             "finding_roi_strategy", "masked_attention"
         )
+        # A1 pilot control: retain the same global prediction/fusion contract
+        # while neutralizing the grounded Finding branch.
+        self.global_only = bool(hierarchy_config.get("global_only", False))
         supported_roi_strategies = {
             "masked_attention",
             "full",
@@ -281,7 +284,9 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             temperature=self._radzero_attention_temperature(),
         )
         fusion = self.evidence_fusion(
-            finding_aggregation.evidence_tokens,
+            torch.zeros_like(finding_aggregation.evidence_tokens)
+            if self.global_only
+            else finding_aggregation.evidence_tokens,
             global_evidence.evidence_tokens,
             global_queries_for_branch,
             global_query_mask=global_query_mask,

@@ -62,6 +62,7 @@ def make_config(
     findings=4,
     globals_=5,
     finding_roi_strategy="masked_attention",
+    global_only=False,
 ):
     config = PretrainedConfig()
     config.pretrained_dir = None
@@ -87,6 +88,7 @@ def make_config(
             "finding_chunk_size": 2,
             "aggregation_num_heads": 2,
             "finding_roi_strategy": finding_roi_strategy,
+            "global_only": global_only,
             "feature_roi_size": 2,
             "finding_local_refiner_dim": 4,
         },
@@ -459,6 +461,16 @@ class HierarchicalModelTest(unittest.TestCase):
                 self.encoded_global,
                 return_loss=True,
             )
+
+
+class GlobalOnlyPilotControlTest(unittest.TestCase):
+    def test_global_only_freezes_finding_aggregator_and_neutralizes_branch(self):
+        model = HierarchyHarness(make_config(global_only=True))
+        modules = model.configure_hierarchy_training("global")
+        self.assertNotIn("finding_aggregator", modules)
+        self.assertTrue(model.global_only)
+        self.assertTrue(all(not p.requires_grad for p in model.finding_aggregator.parameters()))
+        self.assertTrue(any(p.requires_grad for p in model.evidence_fusion.parameters()))
 
 
 class CheckpointMigrationTest(unittest.TestCase):
