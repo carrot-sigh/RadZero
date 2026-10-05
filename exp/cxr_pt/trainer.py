@@ -17,15 +17,20 @@ from exp.cxr_pt.hierarchy_metrics import (
 HIERARCHY_STAGE_ORDER = ("anatomy", "finding", "global", "joint")
 
 
-def validate_hierarchy_schedule(schedule):
+def validate_hierarchy_schedule(schedule, allow_subset=False):
     """Validate an explicit, ordered Anatomy -> Finding -> Global -> Joint plan."""
-    if not isinstance(schedule, list) or len(schedule) != len(HIERARCHY_STAGE_ORDER):
+    if not isinstance(schedule, list) or (not allow_subset and len(schedule) != len(HIERARCHY_STAGE_ORDER)):
         raise ValueError(
             "hierarchy training_schedule must define anatomy, finding, global, "
             "and joint phases."
         )
     stages = tuple(phase.get("stage") for phase in schedule)
-    if stages != HIERARCHY_STAGE_ORDER:
+    if allow_subset:
+        if not stages or any(stage not in HIERARCHY_STAGE_ORDER for stage in stages):
+            raise ValueError(f"Unknown hierarchy training stages: {stages}.")
+        if tuple(sorted(stages, key=HIERARCHY_STAGE_ORDER.index)) != stages or len(set(stages)) != len(stages):
+            raise ValueError(f"Hierarchy training stages must be ordered and unique, got {stages}.")
+    elif stages != HIERARCHY_STAGE_ORDER:
         raise ValueError(
             f"hierarchy training_schedule must follow {HIERARCHY_STAGE_ORDER}, "
             f"got {stages}."

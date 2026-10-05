@@ -39,7 +39,10 @@ def _build_trainer(models, training_args, dataset, data_collator, cfg):
 
 def _run_hierarchy_schedule(models, dataset, data_collator, cfg, deepspeed):
     hierarchy_config = cfg["model"]["model_config"]["hierarchy_config"]
-    schedule = validate_hierarchy_schedule(hierarchy_config.get("training_schedule"))
+    schedule = validate_hierarchy_schedule(
+        hierarchy_config.get("training_schedule"),
+        allow_subset=bool(hierarchy_config.get("global_only", False)),
+    )
     resume_checkpoint = cfg["experiment"].get("resume_from_checkpoint")
     resume_stage = cfg["experiment"].get("resume_stage")
     if resume_checkpoint and resume_stage not in {phase["stage"] for phase in schedule}:

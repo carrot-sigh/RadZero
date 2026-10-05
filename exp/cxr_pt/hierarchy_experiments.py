@@ -1866,7 +1866,9 @@ def run_pilot_orchestrator(args):
             for stage, steps in spec["schedule"]
         )
         overlay.write_text(
-            "model:\n  model_config:\n    hierarchy_config:\n"
+            "model:\n  model_config:\n"
+            f"    pretrained_dir: {_yaml_scalar(args.pretrained_dir)}\n"
+            "    hierarchy_config:\n"
             f"      global_only: {'true' if spec['global_only'] else 'false'}\n"
             f"      finding_roi_strategy: {spec['finding_roi_strategy']}\n"
             "      training:\n        teacher_forcing_start_ratio: 0.0\n"
@@ -1876,11 +1878,16 @@ def run_pilot_orchestrator(args):
             f"    train_indices_path: {_yaml_scalar(train_path)}\n"
             f"    eval_indices_path: {_yaml_scalar(valid_path)}\n"
             "train:\n"
-            f"  output_dir: {_yaml_scalar(variant_dir / 'run')}\n"
             f"  seed: {args.seed}\n"
             f"  eval_steps: {args.eval_steps}\n"
             f"  save_steps: {args.eval_steps}\n"
-            "  evaluation_strategy: steps\n  save_strategy: steps\n",
+            "  evaluation_strategy: steps\n  save_strategy: steps\n"
+            "experiment:\n"
+            f"  output_root_dir: {_yaml_scalar(variant_dir)}\n"
+            "  project: hierarchy_pilot\n"
+            f"  user: {_yaml_scalar(name)}\n"
+            "  name: run\n"
+            "",
             encoding="utf-8",
         )
         command = [
@@ -1949,6 +1956,7 @@ def main():
     orchestrator.add_argument("--seed", type=int, default=42)
     orchestrator.add_argument("--max-steps", type=int, default=500)
     orchestrator.add_argument("--eval-steps", type=int, default=100)
+    orchestrator.add_argument("--pretrained-dir", default="/home/user/gxq/radzero-model")
     orchestrator.add_argument("--execute", action="store_true")
     summary_parser = subparsers.add_parser("pilot-summary", help="Summarize reports attached to a pilot manifest.")
     summary_parser.add_argument("--manifest", required=True)
