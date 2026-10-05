@@ -1883,6 +1883,7 @@ def run_pilot_orchestrator(args):
             f"  per_device_eval_batch_size: {args.batch_size}\n"
             f"  eval_steps: {args.eval_steps}\n"
             f"  save_steps: {args.eval_steps}\n"
+            "  save_total_limit: 2\n"
             "  evaluation_strategy: steps\n  save_strategy: steps\n"
             "experiment:\n"
             f"  output_root_dir: {_yaml_scalar(variant_dir)}\n"
@@ -1900,9 +1901,7 @@ def run_pilot_orchestrator(args):
         manifest["variants"][name] = {"overlay": str(overlay), "command": command}
         if args.execute:
             subprocess.run(command, cwd=str(Path.cwd()), check=True)
-            reports = sorted(
-                (variant_dir / "run" / "inference" / "hierarchy").glob("*-hierarchy.json")
-            )
+            reports = sorted(variant_dir.rglob("*-hierarchy.json"))
             if reports:
                 manifest["variants"][name]["report"] = str(reports[-1])
     manifest_path = output_dir / "pilot_manifest.json"
