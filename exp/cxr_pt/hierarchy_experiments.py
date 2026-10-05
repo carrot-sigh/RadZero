@@ -1306,6 +1306,16 @@ def _module_state_unchanged(module, snapshot):
     )
 
 
+def _module_state_max_abs_delta(module, snapshot):
+    current = module.state_dict()
+    deltas = [
+        (current[name].detach().float().cpu() - value.float()).abs().max().item()
+        for name, value in snapshot.items()
+        if name in current
+    ]
+    return float(max(deltas, default=0.0))
+
+
 def _forced_gate_logits(model, aggregation, features, gate_value):
     fusion = model.evidence_fusion
     device_type = features["global_queries"].device.type
@@ -1581,6 +1591,10 @@ def run_stage3_tiny_overfit(args):
         "anatomy_head": _clone_module_state(model.anatomy_head),
         "finding_head": _clone_module_state(model.finding_head),
     }
+    frozen_module_snapshots = {
+        name: _clone_module_state(getattr(model, name))
+        for name in ("vision_model", "text_model", "align_transformer")
+    }
     model.train()
     trainable_names = [
         name for name, parameter in model.named_parameters() if parameter.requires_grad
@@ -1675,6 +1689,15 @@ def run_stage3_tiny_overfit(args):
         name: _module_state_unchanged(getattr(model, name), snapshot)
         for name, snapshot in upstream_snapshots.items()
     }
+    frozen_module_audit = {
+        name: {
+            "unchanged": _module_state_unchanged(getattr(model, name), snapshot),
+            "max_abs_parameter_delta": _module_state_max_abs_delta(
+                getattr(model, name), snapshot
+            ),
+        }
+        for name, snapshot in frozen_module_snapshots.items()
+    }
     report = {
         "experiment": "stage3_real_tiny_overfit",
         "seed": args.seed,
@@ -1696,6 +1719,7 @@ def run_stage3_tiny_overfit(args):
             if parameter.requires_grad
         ),
         "upstream_unchanged": upstream_unchanged,
+        "frozen_module_audit": frozen_module_audit,
         "initial": initial,
         "final": final,
         "history": history,

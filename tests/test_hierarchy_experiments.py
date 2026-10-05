@@ -10,6 +10,7 @@ from exp.cxr_pt.hierarchy_experiments import (
     _finding_statistics,
     _module_state_unchanged,
     _canonical_split_indices,
+    _module_state_max_abs_delta,
     _select_roi_masks,
     _to_device,
 )
@@ -100,6 +101,7 @@ class HierarchyExperimentsTest(unittest.TestCase):
         with torch.no_grad():
             module.weight.add_(1.0)
         self.assertFalse(_module_state_unchanged(module, snapshot))
+        self.assertAlmostEqual(_module_state_max_abs_delta(module, snapshot), 1.0)
 
 
 if __name__ == "__main__":
