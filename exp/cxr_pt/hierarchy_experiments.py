@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import ImageDraw
+from safetensors.torch import load_file
 
 from common.utils import Config
 from exp.cxr_pt.hierarchy_dataset import HierarchyJsonlDataset, hierarchy_collate_fn
@@ -307,6 +308,21 @@ def _load_finding_head_checkpoint(model, checkpoint_path):
         if key.startswith(prefix)
     }
     model.finding_head.load_state_dict(prefixed or state_dict, strict=True)
+
+
+def _load_full_hierarchy_checkpoint(model, checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_dir():
+        checkpoint_path = checkpoint_path / "model.safetensors"
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Hierarchy checkpoint not found: {checkpoint_path}")
+    state_dict = load_file(str(checkpoint_path))
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Incompatible full hierarchy checkpoint: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
 
 
 def _select_roi_masks(model, batch, visual_tokens, anatomy_queries, args):
@@ -1817,6 +1833,193 @@ def run_stage3_tiny_overfit(args):
     return report
 
 
+def run_pilot_interventions(args):
+    """Evaluate formal C-checkpoint interventions over fixed validation data."""
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device)
+    config = _load_config(args.config, args.config_overrides)
+    config["model"]["model_config"]["hierarchy_config"]["finding_roi_strategy"] = "masked_attention"
+    config["model"]["model_config"]["hierarchy_config"]["global_only"] = False
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    models = load_model(config["model"], output_dir=str(output_dir))
+    model = models["model"]
+    base_encoder_state = {
+        name: _clone_module_state(getattr(model, name))
+        for name in ("vision_model", "text_model", "align_transformer")
+    }
+    _load_full_hierarchy_checkpoint(model, args.checkpoint)
+    frozen_audit = {
+        name: {
+            "unchanged_from_radzero": _module_state_unchanged(getattr(model, name), state),
+            "max_abs_parameter_delta": _module_state_max_abs_delta(getattr(model, name), state),
+        }
+        for name, state in base_encoder_state.items()
+    }
+    model.to(device).eval()
+
+    hierarchy = config["dataset"]["hierarchy"]
+    dataset = HierarchyJsonlDataset(
+        hierarchy["manifest_path"], hierarchy["image_root"], hierarchy["contract_path"],
+        split=hierarchy.get("eval_split", "valid"), patch_grid_size=hierarchy["patch_grid_size"],
+    )
+    indices_path = Path(args.indices_dir) / "pilot_valid_indices.json"
+    payload = json.loads(indices_path.read_text(encoding="utf-8"))
+    indices = [int(index) for index in payload.get("indices", payload)]
+    variant_names = (
+        "normal", "gt_roi_substitution", "full_roi_substitution", "shuffled_roi",
+        "zero_evidence_token", "zero_finding_logits", "zero_full_finding_state",
+        "shuffled_full_finding_state", "finding_only", "global_only",
+    )
+    collected = {name: [] for name in variant_names}
+    targets, valid_masks, gates = [], [], []
+    roi_values = {"mean": [], "max": [], "area": [], "empty": [], "gt_area": []}
+    no_gt_audit = None
+
+    for start in range(0, len(indices), args.batch_size):
+        samples = [dataset[index] for index in indices[start : start + args.batch_size]]
+        batch = hierarchy_collate_fn(
+            samples, tokenizer=models["tokenizer"], image_processor=models["image_processor"],
+            contract_path=hierarchy["contract_path"],
+        )
+        batch = _to_device(batch, device)
+        with torch.no_grad(), torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
+            vision = model.forward_vision_model(batch["pixel_values"])
+            anatomy_queries = model._encode_prompt_bank(batch["encoded_anatomy_prompts"], model.num_anatomies, "anatomy")
+            finding_queries = model._encode_prompt_bank(batch["encoded_finding_prompts"], model.num_findings, "finding")
+            global_queries = model._encode_prompt_bank(batch["encoded_global_prompts"], model.num_global_labels, "global")
+            anatomy = model.anatomy_head(
+                anatomy_queries, vision["image_patch_tokens"], anatomy_query_mask=batch["anatomy_query_mask"]
+            )
+            finding = model.finding_head(
+                finding_queries, vision["image_patch_tokens"], anatomy.roi_masks,
+                anatomy_query_mask=batch["anatomy_query_mask"], compatibility_mask=batch["compatibility_mask"],
+            )
+            global_queries, full_tokens = model._prepare_radzero_global_inputs(global_queries, vision["vision_tokens"])
+            global_evidence = model.global_branch(
+                global_queries, full_tokens, global_query_mask=batch["global_query_mask"],
+                temperature=model._radzero_attention_temperature(),
+            )
+            features = {
+                "global_queries": global_queries,
+                "finding_evidence": finding.evidence_tokens,
+                "finding_logits": finding.finding_logits,
+                "pair_mask": finding.pair_mask,
+                "global_evidence": global_evidence.evidence_tokens,
+                "global_query_mask": batch["global_query_mask"],
+                "global_targets": batch["global_targets"],
+                "global_valid_mask": batch["global_valid_mask"],
+            }
+            normal_aggregation, normal_fusion, _ = _global_forward(model, features)
+            logits = {"normal": normal_fusion.logits}
+
+            roi_masks = {
+                "gt_roi_substitution": batch["gt_anatomy_masks"],
+                "full_roi_substitution": torch.ones_like(batch["gt_anatomy_masks"]),
+                "shuffled_roi": batch["gt_anatomy_masks"][torch.roll(torch.arange(len(samples), device=device), 1)],
+            }
+            for name, masks in roi_masks.items():
+                replacement_finding = model.finding_head(
+                    finding_queries, vision["image_patch_tokens"], masks,
+                    anatomy_query_mask=batch["anatomy_query_mask"], compatibility_mask=batch["compatibility_mask"],
+                )
+                variant = dict(features)
+                variant["finding_evidence"] = replacement_finding.evidence_tokens
+                variant["finding_logits"] = replacement_finding.finding_logits
+                variant["pair_mask"] = replacement_finding.pair_mask
+                _, variant_fusion, _ = _global_forward(model, variant)
+                logits[name] = variant_fusion.logits
+
+            permutation = torch.roll(torch.arange(len(samples), device=device), 1)
+            feature_variants = {}
+            feature_variants["zero_evidence_token"] = {**features, "finding_evidence": torch.zeros_like(features["finding_evidence"])}
+            feature_variants["zero_finding_logits"] = {**features, "finding_logits": torch.zeros_like(features["finding_logits"])}
+            feature_variants["zero_full_finding_state"] = {
+                **features, "finding_evidence": torch.zeros_like(features["finding_evidence"]),
+                "finding_logits": torch.zeros_like(features["finding_logits"]), "pair_mask": torch.zeros_like(features["pair_mask"]),
+            }
+            feature_variants["shuffled_full_finding_state"] = {
+                **features, "finding_evidence": features["finding_evidence"][permutation],
+                "finding_logits": features["finding_logits"][permutation], "pair_mask": features["pair_mask"][permutation],
+            }
+            for name, variant in feature_variants.items():
+                _, variant_fusion, _ = _global_forward(model, variant)
+                logits[name] = variant_fusion.logits
+            logits["finding_only"] = _forced_gate_logits(model, normal_aggregation, features, 1.0)
+            logits["global_only"] = _forced_gate_logits(model, normal_aggregation, features, 0.0)
+
+        for name in variant_names:
+            collected[name].append(logits[name].float().cpu())
+        targets.append(batch["global_targets"].float().cpu())
+        valid_masks.append((batch["global_valid_mask"] & batch["global_query_mask"]).cpu())
+        gates.append(normal_fusion.gates.squeeze(-1).float().cpu())
+        masks = anatomy.roi_masks.float().cpu()
+        gt_masks = batch["gt_anatomy_masks"].float().cpu()
+        roi_values["mean"].append(masks.mean(dim=-1))
+        roi_values["max"].append(masks.max(dim=-1).values)
+        roi_values["area"].append((masks > 0.5).float().mean(dim=-1))
+        roi_values["empty"].append((masks > 0.5).sum(dim=-1) == 0)
+        roi_values["gt_area"].append((gt_masks > 0.5).float().mean(dim=-1))
+
+        if no_gt_audit is None:
+            inference_inputs = {
+                key: batch[key] for key in (
+                    "pixel_values", "encoded_anatomy_prompts", "encoded_finding_prompts",
+                    "encoded_global_prompts", "anatomy_query_mask", "global_query_mask", "compatibility_mask"
+                )
+            }
+            with torch.no_grad():
+                first = model.forward_hierarchy(**inference_inputs).fusion.logits.float()
+                perturbed = model.forward_hierarchy(
+                    **inference_inputs,
+                    gt_anatomy_masks=torch.rand_like(batch["gt_anatomy_masks"]),
+                    anatomy_targets=torch.rand_like(batch["anatomy_targets"]),
+                    finding_targets=torch.rand_like(batch["finding_targets"]),
+                    global_targets=torch.rand_like(batch["global_targets"]),
+                    return_loss=False,
+                ).fusion.logits.float()
+            delta = (first - perturbed).abs()
+            no_gt_audit = {"passed": bool(torch.allclose(first, perturbed, rtol=1e-3, atol=1e-3)), "max_abs_logit_delta": float(delta.max().item())}
+
+    targets = torch.cat(targets)
+    valid = torch.cat(valid_masks).bool()
+    normal = torch.cat(collected["normal"])
+    reports = {}
+    for offset, name in enumerate(variant_names):
+        variant_logits = torch.cat(collected[name])
+        metrics = multilabel_metrics(torch.sigmoid(variant_logits), targets, valid)
+        reports[name] = {
+            "macro_auroc": metrics["auroc"], "macro_auprc": metrics["auprc"], "macro_f1": metrics["f1"],
+            "mean_absolute_logit_delta": float((variant_logits - normal).abs()[valid].mean().item()),
+            "bootstrap": bootstrap_multilabel_metrics(
+                torch.sigmoid(variant_logits), targets, valid, samples=args.bootstrap_samples, seed=args.bootstrap_seed + offset
+            ),
+        }
+    gate_tensor = torch.cat(gates)
+    roi = {key: torch.cat(values) for key, values in roi_values.items()}
+    report = {
+        "experiment": "formal_c_checkpoint_interventions", "checkpoint": args.checkpoint,
+        "validation_samples": len(indices), "seed": args.seed, "shuffle_rule": "deterministic batch roll by one",
+        "metrics": reports,
+        "gate_diagnostics": {
+            "mean": float(gate_tensor.mean().item()), "std": float(gate_tensor.std().item()),
+            "mean_per_label": gate_tensor.mean(dim=0).tolist(), "std_per_label": gate_tensor.std(dim=0).tolist(),
+        },
+        "roi_diagnostics": {
+            "mask_mean": float(roi["mean"].mean().item()), "mask_max": float(roi["max"].mean().item()),
+            "predicted_area": float(roi["area"].mean().item()), "gt_area": float(roi["gt_area"].mean().item()),
+            "empty_mask_rate": float(roi["empty"].float().mean().item()),
+        },
+        "no_gt_audit": no_gt_audit, "frozen_module_audit": frozen_audit,
+    }
+    report_path = output_dir / "formal_interventions.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"report": str(report_path), "metrics": reports}, indent=2))
+    return report
+
+
 def _yaml_scalar(value):
     return json.dumps(str(value))
 
@@ -1963,6 +2166,19 @@ def main():
     summary_parser = subparsers.add_parser("pilot-summary", help="Summarize reports attached to a pilot manifest.")
     summary_parser.add_argument("--manifest", required=True)
     summary_parser.add_argument("--output")
+    intervention_parser = subparsers.add_parser(
+        "pilot-interventions", help="Evaluate formal C-checkpoint interventions."
+    )
+    intervention_parser.add_argument("--config", default="exp/cxr_pt/config.yaml")
+    intervention_parser.add_argument("--config-overrides", nargs="+", default=["radzero.yaml", "hierarchy.yaml", "paths.yaml"])
+    intervention_parser.add_argument("--checkpoint", required=True)
+    intervention_parser.add_argument("--indices-dir", required=True)
+    intervention_parser.add_argument("--output-dir", required=True)
+    intervention_parser.add_argument("--device", default="cuda:0")
+    intervention_parser.add_argument("--batch-size", type=int, default=8)
+    intervention_parser.add_argument("--seed", type=int, default=42)
+    intervention_parser.add_argument("--bootstrap-samples", type=int, default=1000)
+    intervention_parser.add_argument("--bootstrap-seed", type=int, default=42)
     stage2 = subparsers.add_parser("stage2-tiny-overfit")
     stage2.add_argument("--config", default="exp/cxr_pt/config.yaml")
     stage2.add_argument(
@@ -2121,6 +2337,8 @@ def main():
         run_pilot_orchestrator(args)
     elif args.experiment == "pilot-summary":
         run_pilot_summary(args)
+    elif args.experiment == "pilot-interventions":
+        run_pilot_interventions(args)
     elif args.experiment == "stage2-tiny-overfit":
         run_stage2_tiny_overfit(args)
     elif args.experiment == "stage1-pilot":
