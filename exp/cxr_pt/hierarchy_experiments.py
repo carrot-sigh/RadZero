@@ -1372,9 +1372,7 @@ def _run_stage3_interventions(model, features, normal_aggregation, normal_fusion
     variants["zero_finding_logits"] = fusion.logits
 
     zero_full_state = dict(features)
-    zero_full_state["finding_evidence"] = torch.zeros_like(
-        features["finding_evidence"]
-    )
+    zero_full_state["finding_evidence"] = torch.zeros_like(features["finding_evidence"])
     zero_full_state["finding_logits"] = torch.zeros_like(features["finding_logits"])
     zero_full_state["pair_mask"] = torch.zeros_like(features["pair_mask"])
     _, fusion, _ = _global_forward(model, zero_full_state)
@@ -1429,7 +1427,15 @@ def run_stage3_tiny_overfit(args):
         split=hierarchy_config.get("train_split", "train"),
         patch_grid_size=hierarchy_config["patch_grid_size"],
     )
-    indices = _select_global_indices(dataset, args.num_images, args.seed)
+    if args.indices_dir:
+        indices = _canonical_split_indices(
+            dataset,
+            args.num_images,
+            args.seed,
+            Path(args.indices_dir) / "pilot_train_indices.json",
+        )
+    else:
+        indices = _select_global_indices(dataset, args.num_images, args.seed)
     batch = hierarchy_collate_fn(
         [dataset[index] for index in indices],
         tokenizer=models["tokenizer"],
@@ -1772,6 +1778,7 @@ def main():
     stage3.add_argument("--log-every", type=int, default=10)
     stage3.add_argument("--seed", type=int, default=20260930)
     stage3.add_argument("--finding-checkpoint", required=True)
+    stage3.add_argument("--indices-dir")
     stage3.add_argument(
         "--finding-roi-strategy",
         choices=("masked_attention", "full"),
