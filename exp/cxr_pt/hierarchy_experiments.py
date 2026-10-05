@@ -2020,6 +2020,56 @@ def run_pilot_interventions(args):
     return report
 
 
+def run_pilot_a0(args):
+    """Evaluate the released frozen RadZero on the fixed pilot validation split."""
+    device = torch.device(args.device)
+    config = _load_config(args.config, args.config_overrides)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    models = load_model(config["model"], output_dir=str(output_dir))
+    model = models["model"].to(device).eval()
+    hierarchy = config["dataset"]["hierarchy"]
+    dataset = HierarchyJsonlDataset(
+        hierarchy["manifest_path"], hierarchy["image_root"], hierarchy["contract_path"],
+        split=hierarchy.get("eval_split", "valid"), patch_grid_size=hierarchy["patch_grid_size"],
+    )
+    payload = json.loads((Path(args.indices_dir) / "pilot_valid_indices.json").read_text(encoding="utf-8"))
+    indices = [int(index) for index in payload.get("indices", payload)]
+    logits, targets, valid_masks = [], [], []
+    for start in range(0, len(indices), args.batch_size):
+        samples = [dataset[index] for index in indices[start : start + args.batch_size]]
+        batch = hierarchy_collate_fn(
+            samples, tokenizer=models["tokenizer"], image_processor=models["image_processor"],
+            contract_path=hierarchy["contract_path"],
+        )
+        batch = _to_device(batch, device)
+        with torch.no_grad(), torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
+            output = model.compute_logits(
+                pixel_values=batch["pixel_values"],
+                encoded_key_phrases=[batch["encoded_global_prompts"]],
+            )
+        logits.append(output["logits"].float().cpu())
+        targets.append(batch["global_targets"].float().cpu())
+        valid_masks.append((batch["global_valid_mask"] & batch["global_query_mask"]).cpu())
+    logits = torch.cat(logits)
+    targets = torch.cat(targets)
+    valid = torch.cat(valid_masks).bool()
+    metrics = multilabel_metrics(torch.sigmoid(logits), targets, valid, include_per_class=True)
+    report = {
+        "experiment": "A0_original_radzero", "validation_samples": len(indices),
+        "test_accessed": False, "metrics": metrics,
+        "bootstrap": bootstrap_multilabel_metrics(
+            torch.sigmoid(logits), targets, valid, samples=args.bootstrap_samples, seed=args.bootstrap_seed
+        ),
+    }
+    report_path = output_dir / "a0_original_radzero.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"report": str(report_path), "metrics": metrics}, indent=2))
+    return report
+
+
 def _yaml_scalar(value):
     return json.dumps(str(value))
 
@@ -2179,6 +2229,15 @@ def main():
     intervention_parser.add_argument("--seed", type=int, default=42)
     intervention_parser.add_argument("--bootstrap-samples", type=int, default=1000)
     intervention_parser.add_argument("--bootstrap-seed", type=int, default=42)
+    a0_parser = subparsers.add_parser("pilot-a0", help="Evaluate original frozen RadZero.")
+    a0_parser.add_argument("--config", default="exp/cxr_pt/config.yaml")
+    a0_parser.add_argument("--config-overrides", nargs="+", default=["radzero.yaml", "hierarchy.yaml", "paths.yaml"])
+    a0_parser.add_argument("--indices-dir", required=True)
+    a0_parser.add_argument("--output-dir", required=True)
+    a0_parser.add_argument("--device", default="cuda:0")
+    a0_parser.add_argument("--batch-size", type=int, default=8)
+    a0_parser.add_argument("--bootstrap-samples", type=int, default=1000)
+    a0_parser.add_argument("--bootstrap-seed", type=int, default=42)
     stage2 = subparsers.add_parser("stage2-tiny-overfit")
     stage2.add_argument("--config", default="exp/cxr_pt/config.yaml")
     stage2.add_argument(
@@ -2339,6 +2398,8 @@ def main():
         run_pilot_summary(args)
     elif args.experiment == "pilot-interventions":
         run_pilot_interventions(args)
+    elif args.experiment == "pilot-a0":
+        run_pilot_a0(args)
     elif args.experiment == "stage2-tiny-overfit":
         run_stage2_tiny_overfit(args)
     elif args.experiment == "stage1-pilot":
