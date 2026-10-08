@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from exp.cxr_pt.hierarchy_metrics import (
     anatomy_iou_dice,
     bootstrap_multilabel_metrics,
+    finding_anatomy_consistency,
+    paired_bootstrap_metric_delta,
     compute_hierarchy_trainer_metrics,
     export_hierarchy_output,
     evaluate_hierarchy_loader,
@@ -17,6 +19,30 @@ from exp.cxr_pt.hierarchy_metrics import (
 
 
 class HierarchyMetricsTest(unittest.TestCase):
+    def test_paired_cluster_bootstrap_is_reproducible(self):
+        scores = torch.tensor([[0.9, 0.2], [0.7, 0.4], [0.1, 0.8], [0.3, 0.6]])
+        other = 1 - scores
+        targets = torch.tensor([[1, 0], [1, 0], [0, 1], [0, 1]])
+        valid = torch.ones_like(targets, dtype=torch.bool)
+        first = paired_bootstrap_metric_delta(
+            scores, other, targets, valid, clusters=[1, 1, 2, 2], samples=20, seed=9
+        )
+        second = paired_bootstrap_metric_delta(
+            scores, other, targets, valid, clusters=[1, 1, 2, 2], samples=20, seed=9
+        )
+        self.assertEqual(first, second)
+        self.assertTrue(first["clustered"])
+
+    def test_finding_anatomy_consistency_uses_positive_valid_pairs_only(self):
+        attention = torch.tensor([[[[0.5, 0.5, 0.0, 0.0], [0.0, 0.0, 0.5, 0.5]]]])
+        anatomy = torch.tensor([[[1.0, 1.0, 0.0, 0.0]]])
+        targets = torch.tensor([[[1.0, 0.0]]])
+        valid = torch.ones_like(targets, dtype=torch.bool)
+        result = finding_anatomy_consistency(attention, anatomy, targets, valid)
+        self.assertEqual(result["valid_positive_pair_count"], 1)
+        self.assertEqual(result["containment"], 1.0)
+        self.assertEqual(result["uniform_containment"], 0.5)
+        self.assertEqual(result["pointing_accuracy"], 1.0)
     def test_bootstrap_multilabel_metrics_is_reproducible(self):
         scores = torch.tensor([[0.95, 0.05], [0.1, 0.9], [0.8, 0.2], [0.2, 0.8]])
         targets = torch.tensor([[1, 0], [0, 1], [1, 0], [0, 1]])

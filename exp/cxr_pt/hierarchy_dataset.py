@@ -166,6 +166,7 @@ def _scene_to_manifest_row(
 
     return {
         "dicom_id": scene["image_id"],
+        "patient_id": str(scene["patient_id"]),
         "study_id": str(scene["study_id"]),
         "split": split,
         "image": relative_image,
@@ -256,8 +257,17 @@ class HierarchyJsonlDataset(Dataset):
             global_targets[global_index] = value
             global_valid[global_index] = True
 
+        patient_id = row.get("patient_id")
+        if patient_id is None:
+            parts = Path(row["image"]).parts
+            patient_part = next((part for part in parts if part.startswith("p") and len(part) > 3), None)
+            patient_id = patient_part[1:] if patient_part is not None else row["study_id"]
         return {
             "image": image,
+            "dicom_id": row["dicom_id"],
+            "study_id": str(row["study_id"]),
+            "patient_id": str(patient_id),
+            "split_index": int(index),
             "anatomy_targets": anatomy_targets.flatten(1),
             "anatomy_boxes": anatomy_boxes,
             "anatomy_annotation_mask": anatomy_valid,
@@ -375,6 +385,10 @@ def hierarchy_collate_fn(batch, tokenizer, image_processor, contract_path):
     output["compatibility_mask"] = torch.tensor(
         contract["compatibility"]["matrix"], dtype=torch.bool
     )
+    output["sample_metadata"] = {
+        key: [item[key] for item in batch]
+        for key in ("dicom_id", "study_id", "patient_id", "split_index")
+    }
     for name, labels in (
         ("anatomy", contract["anatomy"]["labels"]),
         ("finding", contract["finding"]["labels"]),

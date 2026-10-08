@@ -12,6 +12,12 @@ model:
       finding_logit_temperature: 0.07
       global_logit_temperature: 0.07
       finding_chunk_size: 8
+      # Keep legacy ROI behavior unless an experiment explicitly selects a
+      # static or image-conditioned anatomy-finding pair query.
+      finding_connection_mode: roi_constraint
+      pair_query_num_heads: 8
+      pair_query_chunk_size: 64
+      pair_query_mlp_dim: 256
       # Mainline: Stage 1 predicted ROI -> Stage 2 masked attention.
       # feature_roi/full_refiner are explicit ablation strategies only.
       finding_roi_strategy: masked_attention

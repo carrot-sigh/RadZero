@@ -180,6 +180,7 @@ class CXRPreTrainer(BaseTrainer):
             if hasattr(hierarchy_model, "set_hierarchy_training_step"):
                 hierarchy_model.set_hierarchy_training_step(int(self.state.global_step))
             hierarchy_inputs = dict(inputs)
+            hierarchy_inputs.pop("sample_metadata", None)
             controller = getattr(hierarchy_model, "training_controller", None)
             stage = controller.stage if controller is not None else "joint"
             if stage == "anatomy":
@@ -226,6 +227,7 @@ class CXRPreTrainer(BaseTrainer):
 
         inputs = self._prepare_inputs(inputs)
         inference_inputs = dict(inputs)
+        inference_inputs.pop("sample_metadata", None)
         inference_inputs.pop("gt_anatomy_masks", None)
         controller = getattr(unwrap_model(model), "training_controller", None)
         stage = controller.stage if controller is not None else "joint"

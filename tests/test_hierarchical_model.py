@@ -63,6 +63,7 @@ def make_config(
     globals_=5,
     finding_roi_strategy="masked_attention",
     global_only=False,
+    finding_connection_mode="roi_constraint",
 ):
     config = PretrainedConfig()
     config.pretrained_dir = None
@@ -88,6 +89,10 @@ def make_config(
             "finding_chunk_size": 2,
             "aggregation_num_heads": 2,
             "finding_roi_strategy": finding_roi_strategy,
+            "finding_connection_mode": finding_connection_mode,
+            "pair_query_num_heads": 2,
+            "pair_query_chunk_size": 5,
+            "pair_query_mlp_dim": 4,
             "global_only": global_only,
             "feature_roi_size": 2,
             "finding_local_refiner_dim": 4,
@@ -145,6 +150,146 @@ class HierarchicalModelTest(unittest.TestCase):
             output.vision_outputs["image_patch_tokens"],
             self.pixel_values[:, 1:],
         )
+
+    def test_dynamic_pair_query_uses_override_and_ignores_roi_inputs(self):
+        model = HierarchyHarness(
+            make_config(finding_connection_mode="dynamic_pair_query")
+        )
+        anatomy_queries = self.encoded_anatomy["features"][:, self.hidden_dim :]
+        finding_queries = self.encoded_finding["features"]
+        global_queries = self.encoded_global["features"]
+        override = torch.randn(self.batch_size, self.anatomies, self.hidden_dim)
+        output = model.forward_hierarchy_from_features(
+            self.pixel_values[:, 1:],
+            anatomy_queries,
+            finding_queries,
+            global_queries,
+            global_visual_tokens=self.pixel_values,
+            anatomy_state_override=override,
+        )
+        changed = model.forward_hierarchy_from_features(
+            self.pixel_values[:, 1:],
+            anatomy_queries,
+            finding_queries,
+            global_queries,
+            global_visual_tokens=self.pixel_values,
+            anatomy_state_override=override + 1,
+        )
+        self.assertEqual(
+            output.finding.attention_weights.shape,
+            (self.batch_size, self.anatomies, self.findings, self.tokens),
+        )
+        self.assertFalse(
+            torch.allclose(output.finding.evidence_tokens, changed.finding.evidence_tokens)
+        )
+        with self.assertRaisesRegex(ValueError, "do not accept ROI"):
+            model.forward_hierarchy_from_features(
+                self.pixel_values[:, 1:],
+                anatomy_queries,
+                finding_queries,
+                global_queries,
+                global_visual_tokens=self.pixel_values,
+                anatomy_state_override=override,
+                anatomy_mask_override=torch.ones(
+                    self.batch_size, self.anatomies, self.tokens
+                ),
+            )
+
+    def test_static_and_dynamic_modes_match_with_same_state_and_weights(self):
+        torch.manual_seed(77)
+        dynamic = HierarchyHarness(
+            make_config(finding_connection_mode="dynamic_pair_query")
+        )
+        torch.manual_seed(77)
+        static = HierarchyHarness(
+            make_config(finding_connection_mode="static_pair_query")
+        )
+        static.load_state_dict(dynamic.state_dict())
+        state = torch.randn(self.batch_size, self.anatomies, self.hidden_dim)
+        anatomy_queries = self.encoded_anatomy["features"][:, self.hidden_dim :]
+        arguments = dict(
+            visual_tokens=self.pixel_values[:, 1:],
+            anatomy_queries=anatomy_queries,
+            finding_queries=self.encoded_finding["features"],
+            global_queries=self.encoded_global["features"],
+            global_visual_tokens=self.pixel_values,
+            anatomy_state_override=state,
+        )
+        dynamic.eval()
+        static.eval()
+        dynamic_output = dynamic.forward_hierarchy_from_features(**arguments)
+        static_output = static.forward_hierarchy_from_features(**arguments)
+        torch.testing.assert_close(
+            dynamic_output.finding.finding_logits,
+            static_output.finding.finding_logits,
+        )
+        torch.testing.assert_close(dynamic_output.logits, static_output.logits)
+
+    def test_pair_query_training_freezes_stage1_and_keeps_original_stage3_scope(self):
+        model = HierarchyHarness(
+            make_config(finding_connection_mode="dynamic_pair_query")
+        )
+        finding_modules = set(model.configure_hierarchy_training("finding"))
+        self.assertEqual(finding_modules, {"pair_query_finding_head"})
+        joint_modules = set(model.configure_hierarchy_training("joint"))
+        self.assertEqual(
+            joint_modules,
+            {
+                "pair_query_finding_head",
+                "finding_aggregator",
+                "global_branch",
+                "evidence_fusion",
+            },
+        )
+        self.assertFalse(any(p.requires_grad for p in model.anatomy_head.parameters()))
+        self.assertFalse(model.anatomy_head.training)
+
+    def test_roi_constraint_does_not_read_pair_query_module(self):
+        self.model.eval()
+        before = self.model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+        )
+        with torch.no_grad():
+            for parameter in self.model.pair_query_finding_head.parameters():
+                parameter.normal_(mean=100, std=10)
+        after = self.model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+        )
+        torch.testing.assert_close(before.finding.finding_logits, after.finding.finding_logits)
+        torch.testing.assert_close(before.logits, after.logits)
+
+    def test_pair_query_checkpoint_round_trip_reproduces_logits(self):
+        model = HierarchyHarness(
+            make_config(finding_connection_mode="static_pair_query")
+        )
+        state = torch.randn(self.anatomies, self.hidden_dim)
+        model.pair_query_finding_head.set_static_anatomy_state(state)
+        model.eval()
+        before = model.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+        )
+        restored = HierarchyHarness(
+            make_config(finding_connection_mode="static_pair_query")
+        )
+        restored.load_state_dict(model.state_dict())
+        restored.eval()
+        after = restored.forward_hierarchy(
+            self.pixel_values,
+            self.encoded_anatomy,
+            self.encoded_finding,
+            self.encoded_global,
+        )
+        torch.testing.assert_close(before.finding.finding_logits, after.finding.finding_logits)
+        torch.testing.assert_close(before.logits, after.logits)
 
     def test_feature_roi_output_flows_into_unchanged_stage3(self):
         model = HierarchyHarness(

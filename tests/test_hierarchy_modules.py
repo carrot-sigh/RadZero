@@ -9,6 +9,7 @@ from exp.cxr_pt.model.hierarchy import (
     FeatureROIExtractor,
     FindingEvidenceAggregator,
     FindingLocalRefiner,
+    PairQueryFindingHead,
     GatedEvidenceFusion,
     GlobalEvidenceBranch,
     masks_to_feature_boxes,
@@ -67,6 +68,161 @@ class HierarchyModulesTest(unittest.TestCase):
         torch.testing.assert_close(
             output.roi_mask_logits[valid], output.similarity_scores[valid]
         )
+
+    def test_anatomy_evidence_does_not_depend_on_mask_head_parameters(self):
+        head = AnatomyGroundingHead(self.hidden_dim, num_anatomies=self.anatomy_count)
+        head.eval()
+        before = head(self.anatomy_queries, self.visual_tokens)
+        with torch.no_grad():
+            head.log_roi_scale.fill_(3)
+            head.roi_bias.fill_(-2)
+            for parameter in head.roi_refiner.parameters():
+                parameter.normal_()
+        after = head(self.anatomy_queries, self.visual_tokens)
+        torch.testing.assert_close(before.evidence_tokens, after.evidence_tokens)
+        self.assertFalse(torch.allclose(before.roi_masks, after.roi_masks))
+
+    def test_pair_query_head_shape_attention_chunking_and_gradients(self):
+        head = PairQueryFindingHead(
+            self.hidden_dim,
+            self.anatomy_count,
+            self.finding_count,
+            num_heads=2,
+            query_chunk_size=2,
+            mlp_hidden_dim=4,
+        )
+        anatomy_state = torch.randn(
+            self.batch_size, self.anatomy_count, self.hidden_dim
+        )
+        compatibility = torch.ones(
+            self.anatomy_count, self.finding_count, dtype=torch.bool
+        )
+        compatibility[0, 0] = False
+        head.eval()
+        chunked = head(
+            self.anatomy_queries,
+            self.finding_queries,
+            anatomy_state,
+            self.visual_tokens,
+            compatibility_mask=compatibility,
+            query_chunk_size=2,
+        )
+        full = head(
+            self.anatomy_queries,
+            self.finding_queries,
+            anatomy_state,
+            self.visual_tokens,
+            compatibility_mask=compatibility,
+            query_chunk_size=self.anatomy_count * self.finding_count,
+        )
+        self.assertEqual(
+            full.attention_weights.shape,
+            (self.batch_size, self.anatomy_count, self.finding_count, self.token_count),
+        )
+        for first, second in (
+            (chunked.attention_weights, full.attention_weights),
+            (chunked.evidence_tokens, full.evidence_tokens),
+            (chunked.finding_logits, full.finding_logits),
+        ):
+            torch.testing.assert_close(first, second)
+        torch.testing.assert_close(
+            full.attention_weights[full.pair_mask].sum(dim=-1),
+            torch.ones(int(full.pair_mask.sum())),
+        )
+        self.assertTrue(torch.all(full.attention_weights[~full.pair_mask] == 0))
+        head.train()
+        output = head(
+            self.anatomy_queries,
+            self.finding_queries,
+            anatomy_state,
+            self.visual_tokens,
+            compatibility_mask=compatibility,
+        )
+        output.finding_logits.sum().backward()
+        for parameter in (
+            head.anatomy_state_projection.weight,
+            head.pair_query_mlp[1].weight,
+            head.output_projection.weight,
+        ):
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+
+    def test_pair_query_head_bfloat16_chunking_is_numerically_equivalent(self):
+        head = PairQueryFindingHead(
+            self.hidden_dim,
+            self.anatomy_count,
+            self.finding_count,
+            num_heads=2,
+            query_chunk_size=2,
+            mlp_hidden_dim=4,
+        ).to(dtype=torch.bfloat16)
+        head.eval()
+        anatomy_queries = self.anatomy_queries.to(dtype=torch.bfloat16)
+        finding_queries = self.finding_queries.to(dtype=torch.bfloat16)
+        anatomy_state = torch.randn(
+            self.batch_size,
+            self.anatomy_count,
+            self.hidden_dim,
+            dtype=torch.bfloat16,
+        )
+        visual_tokens = self.visual_tokens.to(dtype=torch.bfloat16)
+        with torch.no_grad():
+            chunked = head(
+                anatomy_queries,
+                finding_queries,
+                anatomy_state,
+                visual_tokens,
+                query_chunk_size=2,
+            )
+            full = head(
+                anatomy_queries,
+                finding_queries,
+                anatomy_state,
+                visual_tokens,
+                query_chunk_size=self.anatomy_count * self.finding_count,
+            )
+        for first, second in (
+            (chunked.attention_weights, full.attention_weights),
+            (chunked.evidence_tokens, full.evidence_tokens),
+            (chunked.finding_logits, full.finding_logits),
+        ):
+            torch.testing.assert_close(first, second, rtol=2e-2, atol=2e-2)
+
+    def test_pair_query_head_fixed_batch_loss_decreases(self):
+        torch.manual_seed(113)
+        head = PairQueryFindingHead(
+            self.hidden_dim,
+            self.anatomy_count,
+            self.finding_count,
+            num_heads=2,
+            query_chunk_size=4,
+            mlp_hidden_dim=4,
+        )
+        anatomy_state = torch.randn(
+            self.batch_size, self.anatomy_count, self.hidden_dim
+        )
+        targets = torch.randint(
+            0, 2, (self.batch_size, self.anatomy_count, self.finding_count)
+        ).float()
+        optimizer = torch.optim.Adam(head.parameters(), lr=1e-2)
+
+        def loss_value():
+            output = head(
+                self.anatomy_queries,
+                self.finding_queries,
+                anatomy_state,
+                self.visual_tokens,
+            )
+            return F.binary_cross_entropy_with_logits(output.finding_logits, targets)
+
+        initial = float(loss_value().detach())
+        for _ in range(30):
+            optimizer.zero_grad()
+            loss = loss_value()
+            loss.backward()
+            optimizer.step()
+        final = float(loss_value().detach())
+        self.assertLess(final, initial)
 
     def test_feature_roi_extracts_known_spatial_region(self):
         visual_tokens = torch.arange(16.0).reshape(1, 16, 1)

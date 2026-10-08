@@ -1,14 +1,22 @@
 import argparse
 import copy
+import hashlib
 import json
 import os
+import subprocess
+import time
 from functools import partial
 from pathlib import Path
 
 import torch
 from torch.utils.data import Subset
 from torch.distributed.elastic.multiprocessing.errors import record
-from transformers import EarlyStoppingCallback, TrainingArguments
+from transformers import (
+    EarlyStoppingCallback,
+    TrainingArguments,
+    enable_full_determinism,
+    set_seed,
+)
 
 from common.code_snapshot import code_snapshot
 from common.trainer import logger
@@ -20,7 +28,129 @@ from exp.cxr_pt.model import load_model
 from exp.cxr_pt.trainer import CXRPreTrainer, validate_hierarchy_schedule
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _module_parameter_fingerprint(module):
+    digest = hashlib.sha256()
+    for name, parameter in sorted(module.named_parameters()):
+        value = parameter.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _write_hierarchy_initialization_audit(model, cfg):
+    hierarchy = cfg["model"]["model_config"]["hierarchy_config"]
+    schedule = validate_hierarchy_schedule(
+        hierarchy.get("training_schedule"), allow_subset=True
+    )
+    module_names = (
+        "anatomy_head",
+        "finding_head",
+        "pair_query_finding_head",
+        "finding_aggregator",
+        "global_branch",
+        "evidence_fusion",
+    )
+    rows = {}
+    for name in module_names:
+        module = getattr(model, name, None)
+        if module is None:
+            continue
+        rows[name] = {
+            "total_parameters": sum(p.numel() for p in module.parameters()),
+            "initialization_sha256": _module_parameter_fingerprint(module),
+            "phase_optimizer_parameters": {},
+        }
+    encoder_names = tuple(model.training_controller.ENCODER_MODULES)
+    rows["frozen_radzero"] = {
+        "total_parameters": sum(
+            p.numel() for name in encoder_names for p in getattr(model, name).parameters()
+        ),
+        "initialization_sha256": hashlib.sha256(
+            "".join(
+                _module_parameter_fingerprint(getattr(model, name))
+                for name in encoder_names
+            ).encode("ascii")
+        ).hexdigest(),
+        "phase_optimizer_parameters": {},
+    }
+    phase_totals = {}
+    for phase in schedule:
+        stage = phase["stage"]
+        configured = model.configure_hierarchy_training(stage)
+        phase_totals[stage] = {
+            "configured_modules": list(configured),
+            "optimizer_parameters": sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            ),
+        }
+        for name, row in rows.items():
+            modules = (
+                [getattr(model, encoder_name) for encoder_name in encoder_names]
+                if name == "frozen_radzero"
+                else [getattr(model, name)]
+            )
+            row["phase_optimizer_parameters"][stage] = sum(
+                p.numel()
+                for module in modules
+                for p in module.parameters()
+                if p.requires_grad
+            )
+    model.configure_hierarchy_training(schedule[0]["stage"])
+    dataset_cfg = cfg["dataset"]["hierarchy"]
+    file_provenance = {}
+    for name, path in {
+        "train_indices": dataset_cfg.get("train_indices_path"),
+        "eval_indices": dataset_cfg.get("eval_indices_path"),
+        "static_anatomy_state": hierarchy.get("static_anatomy_state_path"),
+    }.items():
+        if path:
+            resolved = str(Path(path).resolve())
+            file_provenance[name] = {
+                "path": resolved,
+                "sha256": _sha256_file(resolved),
+            }
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        diff = subprocess.check_output(["git", "diff", "--binary"])
+        diff_sha256 = hashlib.sha256(diff).hexdigest()
+    except (OSError, subprocess.CalledProcessError):
+        commit, diff_sha256 = None, None
+    report = {
+        "seed_set_before_model_construction": int(cfg["train"]["seed"]),
+        "finding_connection_mode": hierarchy.get(
+            "finding_connection_mode", "roi_constraint"
+        ),
+        "modules": rows,
+        "phases": phase_totals,
+        "file_provenance": file_provenance,
+        "git_commit": commit,
+        "git_diff_sha256": diff_sha256,
+    }
+    output = Path(cfg["train"]["output_dir"]) / "initialization_audit.json"
+    output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
 def _build_trainer(models, training_args, dataset, data_collator, cfg):
+    callbacks = []
+    if training_args.load_best_model_at_end:
+        callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=cfg["experiment"]["early_stopping_patience"]
+            )
+        )
     return CXRPreTrainer(
         model=models["model"],
         args=training_args,
@@ -28,11 +158,7 @@ def _build_trainer(models, training_args, dataset, data_collator, cfg):
         eval_dataset=dataset.get("eval"),
         data_collator=data_collator,
         cfg=cfg,
-        callbacks=[
-            EarlyStoppingCallback(
-                early_stopping_patience=cfg["experiment"]["early_stopping_patience"]
-            )
-        ],
+        callbacks=callbacks,
         tokenizer=models["tokenizer"],
     )
 
@@ -41,7 +167,9 @@ def _run_hierarchy_schedule(models, dataset, data_collator, cfg, deepspeed):
     hierarchy_config = cfg["model"]["model_config"]["hierarchy_config"]
     schedule = validate_hierarchy_schedule(
         hierarchy_config.get("training_schedule"),
-        allow_subset=bool(hierarchy_config.get("global_only", False)),
+        allow_subset=bool(hierarchy_config.get("global_only", False))
+        or hierarchy_config.get("finding_connection_mode", "roi_constraint")
+        != "roi_constraint",
     )
     resume_checkpoint = cfg["experiment"].get("resume_from_checkpoint")
     resume_stage = cfg["experiment"].get("resume_stage")
@@ -79,7 +207,87 @@ def _run_hierarchy_schedule(models, dataset, data_collator, cfg, deepspeed):
             phase["num_train_epochs"],
             phase_train_config["output_dir"],
         )
-        trainer.train(resume_from_checkpoint=phase_resume)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        phase_started = time.perf_counter()
+        train_result = trainer.train(resume_from_checkpoint=phase_resume)
+        phase_seconds = time.perf_counter() - phase_started
+        is_world_process_zero = getattr(trainer, "is_world_process_zero", None)
+        if callable(is_world_process_zero) and is_world_process_zero():
+            named = dict(models["model"].named_parameters())
+            trainable = {
+                name: parameter
+                for name, parameter in named.items()
+                if parameter.requires_grad
+            }
+            optimizer_ids = {
+                id(parameter)
+                for group in trainer.optimizer.param_groups
+                for parameter in group["params"]
+            }
+            optimizer_id_list = [
+                id(parameter)
+                for group in trainer.optimizer.param_groups
+                for parameter in group["params"]
+            ]
+            trainable_ids = {id(parameter) for parameter in trainable.values()}
+            parameters_finite = all(
+                bool(torch.isfinite(parameter.detach()).all())
+                for parameter in trainable.values()
+            )
+            optimizer_state_finite = all(
+                bool(torch.isfinite(value.detach()).all())
+                for state in trainer.optimizer.state.values()
+                for value in state.values()
+                if torch.is_tensor(value) and (value.is_floating_point() or value.is_complex())
+            )
+            audit = {
+                "stage": stage,
+                "configured_modules": list(
+                    models["model"].configure_hierarchy_training(stage)
+                ),
+                "trainable_parameter_count": sum(
+                    parameter.numel() for parameter in trainable.values()
+                ),
+                "optimizer_parameter_count": sum(
+                    parameter.numel()
+                    for parameter in named.values()
+                    if id(parameter) in optimizer_ids
+                ),
+                "optimizer_parameter_names": sorted(
+                    name for name, parameter in named.items() if id(parameter) in optimizer_ids
+                ),
+                "optimizer_parameter_ids_unique": len(optimizer_id_list)
+                == len(set(optimizer_id_list)),
+                "optimizer_matches_requires_grad": optimizer_ids == trainable_ids,
+                "trainable_parameters_finite": parameters_finite,
+                "optimizer_state_finite": optimizer_state_finite,
+                "global_step": int(trainer.state.global_step),
+                "wall_clock_seconds": phase_seconds,
+                "seconds_per_optimizer_step": phase_seconds
+                / max(int(trainer.state.global_step), 1),
+                "trainer_train_runtime_seconds": train_result.metrics.get("train_runtime"),
+                "trainer_seconds_per_optimizer_step": (
+                    train_result.metrics.get("train_runtime", phase_seconds)
+                    / max(int(trainer.state.global_step), 1)
+                ),
+                "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated())
+                if torch.cuda.is_available()
+                else None,
+                "peak_gpu_memory_reserved_bytes": int(torch.cuda.max_memory_reserved())
+                if torch.cuda.is_available()
+                else None,
+                "world_size": int(trainer.args.world_size),
+                "per_device_train_batch_size": int(trainer.args.per_device_train_batch_size),
+                "gradient_accumulation_steps": int(trainer.args.gradient_accumulation_steps),
+                "effective_batch_size": int(
+                    trainer.args.world_size
+                    * trainer.args.per_device_train_batch_size
+                    * trainer.args.gradient_accumulation_steps
+                ),
+            }
+            audit_path = Path(phase_train_config["output_dir"]) / "phase_audit.json"
+            audit_path.write_text(json.dumps(audit, indent=2) + "\n", encoding="utf-8")
         resume_checkpoint = None
     return trainer
 
@@ -155,10 +363,16 @@ def main():
 
     deepspeed = dict(cfg["deepspeed"]) if cfg.get("deepspeed") else None
 
+    seed = int(cfg["train"]["seed"])
+    if cfg["train"].get("full_determinism", False):
+        enable_full_determinism(seed)
+    else:
+        set_seed(seed)
     models = load_model(cfg["model"], output_dir=cfg["train"]["output_dir"])
 
     is_hierarchy = cfg["model"].get("model_class_name") == "HierarchicalCxrAlignModel"
     if is_hierarchy:
+        _write_hierarchy_initialization_audit(models["model"], cfg)
         hierarchy_cfg = cfg["dataset"]["hierarchy"]
         train_dataset = HierarchyJsonlDataset(
                 hierarchy_cfg["manifest_path"],

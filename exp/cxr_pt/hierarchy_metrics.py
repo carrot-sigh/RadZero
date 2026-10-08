@@ -93,6 +93,125 @@ def bootstrap_multilabel_metrics(
     return result
 
 
+def paired_bootstrap_metric_delta(
+    first_scores,
+    second_scores,
+    targets,
+    valid_mask,
+    clusters=None,
+    samples=1000,
+    seed=42,
+    metric="auprc",
+):
+    """Paired row or cluster bootstrap for a macro metric difference."""
+    first, targets_np, valid_np = _classification_arrays(
+        first_scores, targets, valid_mask
+    )
+    second, second_targets, second_valid = _classification_arrays(
+        second_scores, targets, valid_mask
+    )
+    if not np.array_equal(targets_np, second_targets) or not np.array_equal(
+        valid_np, second_valid
+    ):
+        raise ValueError("Paired predictions must share targets and validity.")
+    if metric not in {"auprc", "auroc"}:
+        raise ValueError("metric must be auprc or auroc.")
+    if clusters is None:
+        cluster_values = np.arange(first.shape[0])
+    else:
+        clusters = np.asarray(clusters)
+        if clusters.shape != (first.shape[0],):
+            raise ValueError("clusters must contain one value per prediction row.")
+        cluster_values = np.unique(clusters)
+    members = {
+        cluster: np.flatnonzero(clusters == cluster)
+        if clusters is not None
+        else np.asarray([cluster])
+        for cluster in cluster_values
+    }
+    point_first = multilabel_metrics(first, targets_np, valid_np)[metric]
+    point_second = multilabel_metrics(second, targets_np, valid_np)[metric]
+    rng = np.random.default_rng(seed)
+    draws = []
+    for _ in range(samples):
+        sampled = rng.choice(cluster_values, size=len(cluster_values), replace=True)
+        indices = np.concatenate([members[value] for value in sampled])
+        first_value = multilabel_metrics(
+            first[indices], targets_np[indices], valid_np[indices]
+        )[metric]
+        second_value = multilabel_metrics(
+            second[indices], targets_np[indices], valid_np[indices]
+        )[metric]
+        if np.isfinite(first_value) and np.isfinite(second_value):
+            draws.append(float(first_value - second_value))
+    return {
+        "metric": metric,
+        "point_delta": float(point_first - point_second),
+        "ci95": None
+        if not draws
+        else {
+            "lower": float(np.percentile(draws, 2.5)),
+            "upper": float(np.percentile(draws, 97.5)),
+            "valid_draws": len(draws),
+        },
+        "samples": samples,
+        "seed": seed,
+        "clustered": clusters is not None,
+        "cluster_count": int(len(cluster_values)),
+    }
+
+
+def finding_anatomy_consistency(
+    attention,
+    anatomy_targets,
+    finding_targets,
+    valid_pair_mask,
+    anatomy_valid_mask=None,
+):
+    """Measure anatomy containment for explicitly positive annotated pairs."""
+    if attention.dim() != 4:
+        raise ValueError("attention must have shape [B, A, F, L].")
+    if anatomy_targets.dim() == 4:
+        anatomy_targets = anatomy_targets.flatten(2)
+    if anatomy_targets.shape[:2] != attention.shape[:2] or anatomy_targets.size(-1) != attention.size(-1):
+        raise ValueError("anatomy_targets must align with attention B, A and L.")
+    if finding_targets.shape != attention.shape[:3] or valid_pair_mask.shape != finding_targets.shape:
+        raise ValueError("finding targets and validity must have shape [B, A, F].")
+    anatomy_valid = torch.ones_like(anatomy_targets[:, :, 0], dtype=torch.bool)
+    if anatomy_valid_mask is not None:
+        anatomy_valid = anatomy_valid_mask.bool()
+    selected = valid_pair_mask.bool() & (finding_targets == 1) & anatomy_valid.unsqueeze(-1)
+    masks = anatomy_targets.to(dtype=attention.dtype).clamp(0, 1)
+    containment = (attention * masks.unsqueeze(2)).sum(dim=-1)
+    uniform = masks.mean(dim=-1).unsqueeze(-1).expand_as(containment)
+    peaks = attention.argmax(dim=-1)
+    peak_inside = masks.unsqueeze(2).expand_as(attention).gather(
+        -1, peaks.unsqueeze(-1)
+    ).squeeze(-1)
+    return {
+        "valid_positive_pair_count": int(selected.sum().item()),
+        "containment": _selected_mean(containment, selected),
+        "uniform_containment": _selected_mean(uniform, selected),
+        "containment_minus_uniform": _selected_mean(containment - uniform, selected),
+        "pointing_accuracy": _selected_mean(peak_inside, selected),
+        "per_anatomy": [
+            {
+                "anatomy_index": index,
+                "valid_positive_pair_count": int(selected[:, index].sum().item()),
+                "containment": _selected_mean(containment[:, index], selected[:, index]),
+                "uniform_containment": _selected_mean(uniform[:, index], selected[:, index]),
+                "pointing_accuracy": _selected_mean(peak_inside[:, index], selected[:, index]),
+            }
+            for index in range(attention.size(1))
+        ],
+    }
+
+
+def _selected_mean(values, selected):
+    chosen = values[selected]
+    return float(chosen.float().mean().item()) if chosen.numel() else None
+
+
 def _macro_f1(scores, targets, valid, predictions):
     values = []
     for index in range(targets.shape[1]):

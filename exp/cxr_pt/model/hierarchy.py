@@ -187,6 +187,193 @@ class FindingRecognitionOutput:
     pair_mask: torch.Tensor
 
 
+class PairQueryFindingHead(nn.Module):
+    """Extract full-image evidence with anatomy-finding conditioned queries."""
+
+    def __init__(
+        self,
+        hidden_dim,
+        num_anatomies,
+        num_findings,
+        num_heads=8,
+        query_chunk_size=64,
+        mlp_hidden_dim=256,
+        logit_temperature=0.07,
+    ):
+        super().__init__()
+        _validate_temperature(logit_temperature, "logit_temperature")
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
+        if query_chunk_size <= 0:
+            raise ValueError("query_chunk_size must be positive.")
+        if mlp_hidden_dim <= 0:
+            raise ValueError("mlp_hidden_dim must be positive.")
+        self.hidden_dim = hidden_dim
+        self.num_anatomies = num_anatomies
+        self.num_findings = num_findings
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.query_chunk_size = query_chunk_size
+        self.anatomy_state_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.pair_query_mlp = nn.Sequential(
+            nn.LayerNorm(3 * hidden_dim),
+            nn.Linear(3 * hidden_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, hidden_dim),
+        )
+        self.query_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.key_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.value_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.output_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.log_logit_temperature = nn.Parameter(
+            torch.tensor(math.log(logit_temperature))
+        )
+        self.finding_bias = nn.Parameter(torch.zeros(num_findings))
+        self.register_buffer(
+            "static_anatomy_state",
+            torch.zeros(num_anatomies, hidden_dim),
+        )
+        self.register_buffer("static_state_ready", torch.tensor(False))
+
+    def set_static_anatomy_state(self, state):
+        expected = (self.num_anatomies, self.hidden_dim)
+        if tuple(state.shape) != expected or not torch.isfinite(state).all():
+            raise ValueError(
+                f"static anatomy state must be finite with shape {expected}."
+            )
+        self.static_anatomy_state.copy_(
+            state.to(
+                device=self.static_anatomy_state.device,
+                dtype=self.static_anatomy_state.dtype,
+            )
+        )
+        self.static_state_ready.fill_(True)
+
+    def forward(
+        self,
+        anatomy_identity,
+        finding_identity,
+        anatomy_state,
+        visual_tokens,
+        anatomy_query_mask=None,
+        compatibility_mask=None,
+        query_chunk_size=None,
+    ):
+        if visual_tokens.dim() != 3 or visual_tokens.size(-1) != self.hidden_dim:
+            raise ValueError("visual_tokens must have shape [B, L, hidden_dim].")
+        batch_size, token_count, _ = visual_tokens.shape
+        anatomy_identity = _expand_queries(
+            anatomy_identity, batch_size, self.hidden_dim, "anatomy_identity"
+        )
+        finding_identity = _expand_queries(
+            finding_identity, batch_size, self.hidden_dim, "finding_identity"
+        )
+        if anatomy_identity.size(1) != self.num_anatomies:
+            raise ValueError("anatomy_identity count does not match num_anatomies.")
+        if finding_identity.size(1) != self.num_findings:
+            raise ValueError("finding_identity count does not match num_findings.")
+        if anatomy_state.shape != anatomy_identity.shape:
+            raise ValueError("anatomy_state must have shape [B, A, hidden_dim].")
+
+        valid_anatomies = _expand_bool_mask(
+            anatomy_query_mask,
+            (batch_size, self.num_anatomies),
+            "anatomy_query_mask",
+            visual_tokens.device,
+        )
+        valid_pairs = self._compatibility_mask(
+            compatibility_mask, batch_size, visual_tokens.device
+        ) & valid_anatomies.unsqueeze(-1)
+
+        projected_state = self.anatomy_state_projection(anatomy_state)
+        anatomy_features = anatomy_identity[:, :, None, :].expand(
+            -1, -1, self.num_findings, -1
+        )
+        finding_features = finding_identity[:, None, :, :].expand(
+            -1, self.num_anatomies, -1, -1
+        )
+        state_features = projected_state[:, :, None, :].expand(
+            -1, -1, self.num_findings, -1
+        )
+        pair_queries = self.pair_query_mlp(
+            torch.cat([anatomy_features, finding_features, state_features], dim=-1)
+        ).reshape(batch_size, -1, self.hidden_dim)
+
+        keys = self._split_heads(self.key_projection(visual_tokens))
+        values = self._split_heads(self.value_projection(visual_tokens))
+        chunk_size = query_chunk_size or self.query_chunk_size
+        similarities, attentions, evidences = [], [], []
+        for start in range(0, pair_queries.size(1), chunk_size):
+            stop = min(start + chunk_size, pair_queries.size(1))
+            queries = self._split_heads(
+                self.query_projection(pair_queries[:, start:stop])
+            )
+            scores = torch.matmul(queries, keys.transpose(-1, -2)) / math.sqrt(
+                self.head_dim
+            )
+            attention = torch.softmax(scores, dim=-1)
+            evidence = torch.matmul(attention, values)
+            evidence = evidence.transpose(1, 2).reshape(
+                batch_size, stop - start, self.hidden_dim
+            )
+            evidences.append(self.output_projection(evidence))
+            # Head-mean attention is an inspection map; multi-head evidence also
+            # includes per-head values and the learned output projection.
+            similarities.append(scores.mean(dim=1))
+            attentions.append(attention.mean(dim=1))
+
+        similarity_scores = torch.cat(similarities, dim=1).reshape(
+            batch_size,
+            self.num_anatomies,
+            self.num_findings,
+            token_count,
+        )
+        attention_weights = torch.cat(attentions, dim=1).reshape_as(
+            similarity_scores
+        )
+        evidence_tokens = torch.cat(evidences, dim=1).reshape(
+            batch_size, self.num_anatomies, self.num_findings, self.hidden_dim
+        )
+        pair_multiplier = valid_pairs.unsqueeze(-1)
+        similarity_scores = similarity_scores * pair_multiplier
+        attention_weights = attention_weights * pair_multiplier
+        evidence_tokens = evidence_tokens * pair_multiplier
+        matching_scores = F.cosine_similarity(
+            evidence_tokens,
+            finding_identity[:, None, :, :],
+            dim=-1,
+        )
+        finding_logits = matching_scores / _bounded_temperature(
+            self.log_logit_temperature
+        ) + self.finding_bias.view(1, 1, -1)
+        finding_logits = finding_logits * valid_pairs
+        if self.training:
+            similarity_scores = similarity_scores.detach()
+            attention_weights = attention_weights.detach()
+        return FindingRecognitionOutput(
+            similarity_scores=similarity_scores,
+            masked_similarity_scores=similarity_scores,
+            attention_weights=attention_weights,
+            evidence_tokens=evidence_tokens,
+            matching_scores=matching_scores,
+            finding_logits=finding_logits,
+            pair_mask=valid_pairs,
+        )
+
+    def _split_heads(self, value):
+        return value.reshape(
+            value.size(0), value.size(1), self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+    def _compatibility_mask(self, mask, batch_size, device):
+        shape = (batch_size, self.num_anatomies, self.num_findings)
+        if mask is None:
+            return torch.ones(shape, dtype=torch.bool, device=device)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        return _expand_bool_mask(mask, shape, "compatibility_mask", device)
+
+
 class FeatureROIExtractor(nn.Module):
     """Extract fixed-resolution anatomy features from a full patch grid."""
 

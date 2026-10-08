@@ -11,6 +11,7 @@ from .hierarchy import (
     FindingAggregationOutput,
     FindingEvidenceAggregator,
     FindingLocalRefiner,
+    PairQueryFindingHead,
     FindingRecognitionOutput,
     GatedEvidenceFusion,
     GatedFusionOutput,
@@ -45,6 +46,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
     pretrained_missing_key_prefixes = (
         "anatomy_head.",
         "finding_head.",
+        "pair_query_finding_head.",
         "finding_local_refiner.",
         "finding_aggregator.",
         "global_branch.",
@@ -82,6 +84,39 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             finding_chunk_size=hierarchy_config.get("finding_chunk_size"),
             empty_mask_policy=empty_mask_policy,
         )
+        self.finding_connection_mode = hierarchy_config.get(
+            "finding_connection_mode", "roi_constraint"
+        )
+        supported_connection_modes = {
+            "roi_constraint",
+            "static_pair_query",
+            "dynamic_pair_query",
+        }
+        if self.finding_connection_mode not in supported_connection_modes:
+            raise ValueError(
+                "hierarchy_config.finding_connection_mode must be one of "
+                f"{sorted(supported_connection_modes)}."
+            )
+        self.pair_query_finding_head = PairQueryFindingHead(
+            self.hidden_size,
+            self.num_anatomies,
+            self.num_findings,
+            num_heads=hierarchy_config.get("pair_query_num_heads", 8),
+            query_chunk_size=hierarchy_config.get("pair_query_chunk_size", 64),
+            mlp_hidden_dim=hierarchy_config.get("pair_query_mlp_dim", 256),
+            logit_temperature=hierarchy_config.get("finding_logit_temperature", 0.07),
+        )
+        static_state_path = hierarchy_config.get("static_anatomy_state_path")
+        if static_state_path:
+            from exp.cxr_pt.pair_query_state import load_static_anatomy_state
+
+            state, self.static_anatomy_state_metadata = load_static_anatomy_state(
+                static_state_path,
+                hierarchy_config.get("static_anatomy_state_expected"),
+            )
+            self.pair_query_finding_head.set_static_anatomy_state(state)
+        else:
+            self.static_anatomy_state_metadata = None
         self.finding_roi_strategy = hierarchy_config.get(
             "finding_roi_strategy", "masked_attention"
         )
@@ -154,6 +189,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         anatomy_valid_mask=None,
         finding_valid_mask=None,
         global_valid_mask=None,
+        anatomy_state_override=None,
         return_loss=False,
     ):
         vision_outputs = self.forward_vision_model(pixel_values)
@@ -190,6 +226,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             anatomy_valid_mask=anatomy_valid_mask,
             finding_valid_mask=finding_valid_mask,
             global_valid_mask=global_valid_mask,
+            anatomy_state_override=anatomy_state_override,
             return_loss=return_loss,
         )
 
@@ -218,6 +255,7 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
         anatomy_valid_mask=None,
         finding_valid_mask=None,
         global_valid_mask=None,
+        anatomy_state_override=None,
         return_loss=False,
     ):
         self._validate_feature_counts(anatomy_queries, finding_queries, global_queries)
@@ -237,29 +275,57 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             raise ValueError(
                 "global_visual_tokens must contain CLS followed by all patch tokens."
             )
-        anatomy = self.anatomy_head(
-            anatomy_queries,
-            visual_tokens,
-            anatomy_query_mask=anatomy_query_mask,
-            visual_token_mask=visual_token_mask,
+        run_anatomy_head = not (
+            self.finding_connection_mode == "static_pair_query"
+            and anatomy_targets is None
+            and anatomy_state_override is None
         )
-        anatomy_masks_used = self._resolve_anatomy_masks(
-            anatomy.roi_masks,
-            anatomy_mask_override,
-            gt_anatomy_masks,
-            teacher_forcing_ratio,
-            detach_anatomy_masks,
+        anatomy = (
+            self.anatomy_head(
+                anatomy_queries,
+                visual_tokens,
+                anatomy_query_mask=anatomy_query_mask,
+                visual_token_mask=visual_token_mask,
+            )
+            if run_anatomy_head
+            else self._empty_anatomy_output(visual_tokens, anatomy_queries)
         )
-        finding = self._forward_finding_branch(
-            finding_queries=finding_queries,
-            visual_tokens=visual_tokens,
-            anatomy_masks=anatomy_masks_used,
-            anatomy_boxes=anatomy_boxes,
-            anatomy_query_mask=anatomy_query_mask,
-            anatomy_annotation_mask=anatomy_annotation_mask,
-            compatibility_mask=compatibility_mask,
-            finding_chunk_size=finding_chunk_size,
-        )
+        if self.finding_connection_mode == "roi_constraint":
+            anatomy_masks_used = self._resolve_anatomy_masks(
+                anatomy.roi_masks,
+                anatomy_mask_override,
+                gt_anatomy_masks,
+                teacher_forcing_ratio,
+                detach_anatomy_masks,
+            )
+            finding = self._forward_finding_branch(
+                finding_queries=finding_queries,
+                visual_tokens=visual_tokens,
+                anatomy_masks=anatomy_masks_used,
+                anatomy_boxes=anatomy_boxes,
+                anatomy_query_mask=anatomy_query_mask,
+                anatomy_annotation_mask=anatomy_annotation_mask,
+                compatibility_mask=compatibility_mask,
+                finding_chunk_size=finding_chunk_size,
+            )
+        else:
+            if anatomy_mask_override is not None or teacher_forcing_ratio is not None:
+                raise ValueError("Pair-query modes do not accept ROI or teacher forcing.")
+            anatomy_masks_used = anatomy.roi_masks.detach()
+            anatomy_state = self._select_pair_query_anatomy_state(
+                anatomy.evidence_tokens,
+                anatomy_state_override,
+                visual_tokens,
+            )
+            finding = self.pair_query_finding_head(
+                anatomy_queries,
+                finding_queries,
+                anatomy_state,
+                visual_tokens,
+                anatomy_query_mask=anatomy_query_mask,
+                compatibility_mask=compatibility_mask,
+                query_chunk_size=finding_chunk_size,
+            )
         global_queries_for_branch, global_visual_tokens = (
             self._prepare_radzero_global_inputs(
                 global_queries,
@@ -431,6 +497,18 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
 
     def configure_hierarchy_training(self, stage=None):
         modules = list(self.training_controller.configure_model(self, stage=stage))
+        if self.finding_connection_mode != "roi_constraint":
+            for parameter in self.anatomy_head.parameters():
+                parameter.requires_grad = False
+            for parameter in self.finding_head.parameters():
+                parameter.requires_grad = False
+            modules = [
+                name for name in modules if name not in {"anatomy_head", "finding_head"}
+            ]
+            if self.training_controller.stage in {"finding", "joint"}:
+                for parameter in self.pair_query_finding_head.parameters():
+                    parameter.requires_grad = True
+                modules.append("pair_query_finding_head")
         if self.training_controller.stage in {
             "finding",
             "joint",
@@ -440,6 +518,40 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
             modules.append("finding_local_refiner")
         self.train(self.training)
         return tuple(modules)
+
+    def _select_pair_query_anatomy_state(
+        self, dynamic_state, override, visual_tokens
+    ):
+        if override is not None:
+            state = override
+        elif self.finding_connection_mode == "dynamic_pair_query":
+            state = dynamic_state
+        else:
+            if not bool(self.pair_query_finding_head.static_state_ready.item()):
+                raise ValueError("static_pair_query requires a loaded static anatomy state.")
+            state = self.pair_query_finding_head.static_anatomy_state.unsqueeze(0).expand(
+                visual_tokens.size(0), -1, -1
+            )
+        expected = (visual_tokens.size(0), self.num_anatomies, self.hidden_size)
+        if tuple(state.shape) != expected:
+            raise ValueError(f"anatomy_state must have shape {expected}.")
+        return state.to(device=visual_tokens.device, dtype=visual_tokens.dtype)
+
+    @staticmethod
+    def _empty_anatomy_output(visual_tokens, anatomy_queries):
+        batch_size, token_count, hidden_dim = visual_tokens.shape
+        anatomy_count = anatomy_queries.size(-2)
+        spatial = visual_tokens.new_zeros(batch_size, anatomy_count, token_count)
+        return AnatomyGroundingOutput(
+            roi_mask_logits=spatial,
+            roi_masks=spatial,
+            similarity_scores=spatial,
+            attention_weights=spatial,
+            evidence_tokens=visual_tokens.new_zeros(
+                batch_size, anatomy_count, hidden_dim
+            ),
+            matching_logits=visual_tokens.new_zeros(batch_size, anatomy_count),
+        )
 
     def _forward_finding_branch(
         self,
@@ -502,6 +614,8 @@ class HierarchicalCxrAlignModel(CxrAlignModel):
                     parameter.requires_grad for parameter in module.parameters()
                 ):
                     module.eval()
+            if self.finding_connection_mode != "roi_constraint":
+                self.anatomy_head.eval()
         return self
 
     def set_hierarchy_training_step(self, step):

@@ -6,7 +6,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 
 from common.trainer import logger
 
-from .checkpoint import load_radzero_state_dict
+from .checkpoint import load_radzero_state_dict, load_selected_module_state_dict
 from .configuration import CxrAlignConfig
 from .hierarchical_modeling import HierarchicalCxrAlignModel, HierarchicalModelOutput
 from .hierarchy import (
@@ -17,6 +17,7 @@ from .hierarchy import (
     FindingAggregationOutput,
     FindingEvidenceAggregator,
     FindingLocalRefiner,
+    PairQueryFindingHead,
     FindingRecognitionOutput,
     GatedEvidenceFusion,
     GatedFusionOutput,
@@ -76,6 +77,20 @@ def load_model(config, **kwargs):
             incompatible.verification_key,
             len(incompatible.missing_keys),
         )
+    if is_hierarchy:
+        anatomy_checkpoint = config["model_config"]["hierarchy_config"].get(
+            "pretrained_anatomy_checkpoint"
+        )
+        if anatomy_checkpoint:
+            loaded = load_selected_module_state_dict(
+                model, anatomy_checkpoint, ("anatomy_head.",)
+            )
+            logger.info(
+                "Loaded %d Anatomy Head tensors only from %s; Finding and Stage 3 "
+                "weights were not loaded.",
+                len(loaded),
+                anatomy_checkpoint,
+            )
 
     # load adapter & trained parameters
     if config["adapter_ckpt"]:

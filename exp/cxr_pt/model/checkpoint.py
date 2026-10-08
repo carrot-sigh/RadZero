@@ -80,3 +80,40 @@ def load_radzero_state_dict(model, checkpoint_path):
         unexpected_keys=incompatible.unexpected_keys,
         verification_key=verification_key,
     )
+
+
+def load_selected_module_state_dict(model, checkpoint_path, prefixes):
+    """Load only explicitly named module prefixes from a hierarchy checkpoint."""
+    checkpoint_path = os.fspath(checkpoint_path)
+    if os.path.isdir(checkpoint_path):
+        checkpoint_path = os.path.join(checkpoint_path, "model.safetensors")
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+    if checkpoint_path.endswith(".safetensors"):
+        state_dict = load_file(checkpoint_path)
+    else:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        state_dict = state_dict.get("state_dict", state_dict)
+    selected = {
+        key: value
+        for key, value in state_dict.items()
+        if any(key.startswith(prefix) for prefix in prefixes)
+    }
+    if not selected:
+        raise RuntimeError(
+            f"No checkpoint tensors matched prefixes {tuple(prefixes)}."
+        )
+    model_state = model.state_dict()
+    unexpected = sorted(set(selected) - set(model_state))
+    mismatched = sorted(
+        key
+        for key, value in selected.items()
+        if key in model_state and value.shape != model_state[key].shape
+    )
+    if unexpected or mismatched:
+        raise RuntimeError(
+            f"Selected checkpoint is incompatible: unexpected={unexpected}, "
+            f"shape_mismatch={mismatched}."
+        )
+    model.load_state_dict(selected, strict=False)
+    return sorted(selected)
